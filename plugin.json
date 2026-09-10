@@ -1,8 +1,16 @@
 {
   "id": "opss.mambo-rvc-onnx",
   "name": "Mambo RVC ONNX",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "runtime": "native",
+  "description": "曼波RVC变声器",
+  "license": "Unlicense",
+  "platforms": ["windows"],
+  "arches":["x86_64"],
+  "updateUrl": "https://micyou-dev.github.io/MicYou-Plugins/plugin/opss.mambo-rvc-onnx/plugin.json",
+  "downloadUrl": "https://github.com/OrientCOMPASS/Mambo-RVC-ONNX/releases/download/v1.0.0/opss.mambo-rvc-onnx.zip",
+  "readmeUrl": "https://raw.githubusercontent.com/OrientCOMPASS/Mambo-RVC-ONNX/refs/heads/main/README.md",
+  "apiVersion": 1,
   "entry": "mambo_rvc_onnx",
   "kind": "dsp",
   "dsp": {
