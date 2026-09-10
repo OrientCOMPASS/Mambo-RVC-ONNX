@@ -1,0 +1,47 @@
+{
+  "id": "opss.mambo-rvc-onnx",
+  "name": "Mambo RVC ONNX",
+  "version": "0.1.0",
+  "runtime": "native",
+  "entry": "mambo_rvc_onnx",
+  "kind": "dsp",
+  "dsp": {
+    "insertAfter": "VAD",
+    "realtimeSafe": true
+  },
+  "capabilities": ["dsp.node", "config.read"],
+  "configSchema": {
+    "fields": [
+      { 
+        "key": "chunk_ms", 
+        "fieldType": "number", 
+        "label": "Chunk Size (ms) / 输出块大小", 
+        "min": 50, "max": 1000, "step": 50, "default": 100 
+      },
+      { 
+        "key": "extra_ms", 
+        "fieldType": "number", 
+        "label": "Extra Context (ms) / 保护带(决定延迟与F0准确度)", 
+        "min": 50, "max": 1000, "step": 50, "default": 400 
+      },
+      { 
+        "key": "crossfade_ms", 
+        "fieldType": "number", 
+        "label": "Crossfade (ms) / 交叉淡化(掩盖边界毛刺)", 
+        "min": 5, "max": 100, "step": 5, "default": 50 
+      },
+      { 
+        "key": "f0_up_key", 
+        "fieldType": "number", 
+        "label": "Pitch Shift (Semitones) / 变调半音数", 
+        "min": -24, "max": 24, "step": 1, "default": 0 
+      }
+    ]
+  },
+  "config": {
+    "chunk_ms": 100,
+    "extra_ms": 400,
+    "crossfade_ms": 20,
+    "f0_up_key": 0
+  }
+}
