@@ -1,13 +1,26 @@
 [package]
 name = "mambo-rvc-onnx"
-version = "0.1.0"
+version = "1.1.0"
 edition = "2021"
+description = "曼波RVC变声器 (MicYou native DSP plugin)"
+license = "Unlicense"
 
 [lib]
+name = "mambo_rvc_onnx"
 crate-type = ["cdylib"]
 
 [dependencies]
 anyhow = "1"
-ort = { version = "2.0.0-rc.13", features = ["load-dynamic", "cuda"] }
-rustfft = "6.1"
+# load-dynamic: 运行期从插件目录 libs/ 加载 onnxruntime.dll，不在编译期下载二进制
+# default-features = false: 关掉 download-binaries（它会拉 ureq/openssl，纯浪费编译时间）
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["load-dynamic", "cuda"] }
+rustfft = "6"
 crossbeam-channel = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# 注意：绝对不要设置 panic = "abort"。
+# 本 cdylib 运行在宿主进程内，abort 会直接带走整个 MicYou；
+# 保持 unwind 才能让 lib.rs 的 catch_unwind 把插件内部的 panic 挡在边界内。
