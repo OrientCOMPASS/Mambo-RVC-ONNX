@@ -27,7 +27,9 @@ use stream::AudioRingBuffer;
 const MPL_ABI_VERSION: u32 = 1;
 const MPL_API_VERSION: u32 = 1;
 const PLUGIN_ID: &[u8] = b"opss.mambo-rvc-onnx\0";
-const PLUGIN_VERSION: &[u8] = b"1.1.0\0";
+/// 直接从 Cargo.toml 派生（含结尾 NUL），避免 `micyou_plugin_info().version`、
+/// Cargo.toml、plugin.json 三处版本号各自漂移。CI 会校验 Cargo.toml 与 plugin.json 一致。
+const PLUGIN_VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
 /// 48kHz 下 1 秒。宿主每次交给 process 的是 `N*480*channels` 个交织样本
 /// （N 取决于网络包大小与抖动），超过这个上限才会 bypass。

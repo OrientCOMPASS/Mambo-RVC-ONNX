@@ -5,12 +5,17 @@
 //! 找不到才回退到插件自带模型。设置里的 `model_file` 可以显式指定；不填就自动挑
 //! `user_models/` 下修改时间最新的 `.onnx`。
 //!
+//! ## 按模型声明自适应装配输入
+//! 用户模型来自各种导出脚本，命名与签名都不统一（`nsff0`/`pitchf`、`sid`/`ds`、
+//! 有没有 `rnd`、HuBERT 的 `source` 是秩 2 还是秩 3、mask 是 bool 还是 int64）。
+//! 所以这里读模型**声明的 dtype 与秩**来决定怎么建张量，只把符号维实例化，其余照抄声明。
+//! 详见「输入装配」一节。
+//!
 //! ## 性能
-//! 单块推理耗时 τ 必须小于 chunk_ms，否则会持续积压并触发断流。为此这里做了三件事：
-//! - `GraphOptimizationLevel::Level3`（1.0 用的 Level1 少了 attention/layout 融合，对 transformer 慢数倍）；
-//! - RMVPE 的 mel 前端全部缓存：Hann 窗、128×513 滤波器组、FFT plan、所有中间缓冲只建一次
-//!   （1.0 每块都重建 planner + 重算 mel_basis + 分配数 MB）；magnitude 改成 `[frame][freq]`
-//!   连续布局，mel 矩阵乘从跨步访存变成顺序访存；
+//! 单块推理耗时 τ 必须小于 chunk_ms，否则会持续积压并触发断流。为此：
+//! - `GraphOptimizationLevel::All`（1.0 用的 Level1 少了 attention/layout 融合，对 transformer 慢数倍）；
+//! - RMVPE 的 mel 前端全部缓存：Hann 窗、128×513 滤波器组、FFT plan、所有中间缓冲只建一次；
+//!   magnitude 用 `[frame][freq]` 连续布局，mel 矩阵乘是顺序访存；
 //! - f0 后处理不再每帧分配 Vec；中值滤波用 `total_cmp`，遇到 NaN 不会 panic。
 
 use std::fs;
@@ -20,7 +25,7 @@ use std::time::SystemTime;
 
 use anyhow::{bail, Result};
 use ort::session::{builder::GraphOptimizationLevel, Session, SessionOutputs};
-use ort::value::{DynValue, Tensor};
+use ort::value::{DynValue, Tensor, TensorElementType, ValueType};
 use rustfft::{num_complex::Complex, FftPlanner};
 
 use crate::logger;
@@ -82,8 +87,39 @@ mod imp {
 mod imp {
     use std::path::PathBuf;
 
+    #[repr(C)]
+    struct DlInfo {
+        dli_fname: *const std::ffi::c_char,
+        dli_fbase: *mut std::ffi::c_void,
+        dli_sname: *const std::ffi::c_char,
+        dli_saddr: *mut std::ffi::c_void,
+    }
+
+    extern "C" {
+        fn dladdr(addr: *mut std::ffi::c_void, info: *mut DlInfo) -> i32;
+    }
+
+    /// 本 cdylib 自己所在的目录。
+    ///
+    /// 必须用 `dladdr` 反查「本函数地址所属的共享对象」，不能用 `current_exe()`：
+    /// 后者返回的是**宿主进程**的可执行文件目录，插件会跑到宿主安装目录里去找
+    /// libs/ 和 models/，于是永远加载不到自己的模型（rvc-harness 就是这么发现的）。
     pub fn current_module_dir() -> Option<PathBuf> {
-        // 非 Windows 平台仅用于开发期 cargo check；dladdr 才是正确做法。
+        unsafe {
+            let mut info = DlInfo {
+                dli_fname: std::ptr::null(),
+                dli_fbase: std::ptr::null_mut(),
+                dli_sname: std::ptr::null(),
+                dli_saddr: std::ptr::null_mut(),
+            };
+            let addr = current_module_dir as *const () as *mut std::ffi::c_void;
+            if dladdr(addr, &mut info) != 0 && !info.dli_fname.is_null() {
+                let path = std::ffi::CStr::from_ptr(info.dli_fname).to_string_lossy().into_owned();
+                if let Some(parent) = PathBuf::from(&path).parent() {
+                    return Some(parent.to_path_buf());
+                }
+            }
+        }
         std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
     }
 
@@ -321,7 +357,7 @@ fn is_feature_model(p: &Path) -> bool {
         .any(|kw| name.contains(kw))
 }
 
-// ────────────────────────── ONNX 会话与推理 ──────────────────────────
+// ────────────────────────── ONNX 会话 ──────────────────────────
 pub const HOP_48K: usize = 480; // 48kHz / 100fps
 pub const FEAT_DIM: usize = 768; // HuBERT 隐藏维度
 
@@ -333,9 +369,13 @@ pub fn load_session(path: &str, allow_cpu_fallback: bool) -> Result<Session> {
     let cuda = ort::ep::CUDA::default().with_device_id(0).build();
     let mut builder = Session::builder()
         .map_err(|e| anyhow::anyhow!("builder: {e}"))?
-        // Level3 = 全部图优化（含 attention / layout 融合）。
-        // 1.0 用的 Level1 只做基础重写，对 transformer 结构会慢数倍。
-        .with_optimization_level(GraphOptimizationLevel::Level3)
+        // 全部图优化（= ORT_ENABLE_ALL = 99，含 attention / layout 融合）。
+        // ⚠️ 不要用 Level3：ort rc.13 把 Level3 映射成 ORT_ENABLE_LAYOUT(=3)，
+        // 而 ONNX Runtime 的 SetSessionGraphOptimizationLevel 只接受 {0,1,2,99}，
+        // 传 3 会直接报 "graph_optimization_level is not valid" ⇒ 三个模型全部加载失败、
+        // 插件永久静音。这个错误编译期查不出来，是靠 rvc-harness 跑真实 CPU 推理才抓到的。
+        // 1.0 用的 Level1(=ORT_ENABLE_BASIC) 只做基础重写，对 transformer 结构会慢数倍。
+        .with_optimization_level(GraphOptimizationLevel::All)
         .map_err(|e| anyhow::anyhow!("optimization level: {e}"))?;
 
     if allow_cpu_fallback {
@@ -353,27 +393,336 @@ pub fn load_session(path: &str, allow_cpu_fallback: bool) -> Result<Session> {
         .map_err(|e| anyhow::anyhow!("load {path}: {e}"))
 }
 
-/// 打印模型输入签名，方便用户排查“我自己的模型为什么跑不起来”。
-pub fn log_inputs(tag: &str, session: &Session) {
-    let names: Vec<String> = session
-        .inputs()
-        .iter()
-        .map(|i| format!("{}:{:?}", i.name(), i.dtype()))
-        .collect();
-    logger::log(&format!("[Model] {tag} inputs = [{}]", names.join(", ")));
+// ─────────────────────────── 输入装配（按模型声明自适应）───────────────────────────
+//
+// 用户自己的模型来自各种导出脚本，命名和签名都不统一。实测过的三种：
+//   插件自带 : phone f32[1,T,768] / phone_lengths i64[B] / pitch i64[1,T] / nsff0 f32[1,T] / sid i64[B]
+//   GuraTalkV2: phone f32[1,T,768] / phone_lengths i64[B] / pitch i64[1,T] / **pitchf** f32[1,T]
+//              / **ds** i64[B] / **rnd** f32[1,192,T]     <- 名字不同，还多一个必需的噪声输入
+//   HuBERT(MidFord327): **source f32[B,L]（秩 2，不是 [1,1,L]）** / **padding_mask bool[B,L]**
+//
+// 所以这里不再按名字硬编码形状与类型，而是**读模型声明的 dtype 与秩**，
+// 只把符号维（-1）实例化成 frames / 音频长度，其余一律照抄声明。
+
+/// 一个输入在推理里扮演的角色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Phone,
+    PhoneLen,
+    Pitch,
+    NsfF0,
+    Sid,
+    Noise,
+    Mask,
+    Audio,
+    Scalar,
+    Unknown,
 }
 
-// ─────────────────────────── HuBERT ───────────────────────────
+fn is_int_ty(ty: TensorElementType) -> bool {
+    matches!(
+        ty,
+        TensorElementType::Int8
+            | TensorElementType::Int16
+            | TensorElementType::Int32
+            | TensorElementType::Int64
+            | TensorElementType::Uint8
+            | TensorElementType::Uint16
+            | TensorElementType::Uint32
+    )
+}
+
+/// 按「名字 + 声明的 dtype」分类。
+///
+/// 顺序很重要：`phone_lengths` 同时含 phone 和 len；`pitchf` 同时含 pitch 和 f0。
+/// 光看名字会把 `pitchf` 判成 coarse pitch（int64），喂进去就是
+/// `Unexpected input data type. Actual: tensor(int64), expected: tensor(float)`，
+/// 所以 f0 这一类必须结合 dtype 判断。
+pub fn classify(name: &str, ty: TensorElementType) -> Role {
+    let n = name.to_lowercase();
+    let int = is_int_ty(ty);
+    if n.contains("len") {
+        return Role::PhoneLen;
+    }
+    if n.contains("mask") {
+        return Role::Mask;
+    }
+    if (n.contains("rnd") || n.contains("noise") || n.contains("random") || n == "z") && !n.contains("scale") {
+        return Role::Noise;
+    }
+    if n.contains("nsff0") || n.contains("pitchf") || (n.contains("f0") && !int) {
+        return Role::NsfF0;
+    }
+    if n.contains("pitch") {
+        return Role::Pitch;
+    }
+    if n.contains("phone") || n.contains("content") || n.contains("feats") || n.contains("hubert") || n.contains("cvec")
+    {
+        return Role::Phone;
+    }
+    if n.contains("sid") || n.contains("speaker") || n.contains("spk") || n.contains("singer") || n == "ds" {
+        return Role::Sid;
+    }
+    if n.contains("source") || n.contains("input_values") || n.contains("wav") || n.contains("audio") || n == "input" {
+        return Role::Audio;
+    }
+    if n.contains("scale") || n.contains("vol") || n.contains("gain") || n.contains("threshold") {
+        return Role::Scalar;
+    }
+    Role::Unknown
+}
+
+/// VITS/RVC 系常见的标量超参默认值（名字对得上就用，对不上填 0 并告警）。
+fn scalar_default(name: &str) -> f64 {
+    let n = name.to_lowercase();
+    if n.contains("noise_scale_w") {
+        0.8
+    } else if n.contains("noise_scale") {
+        0.667
+    } else if n.contains("length_scale") || n.contains("len_scale") {
+        1.0
+    } else if n.contains("vol") || n.contains("scale") || n.contains("gain") {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// 一个已声明输入的装配说明书。
+#[derive(Debug, Clone)]
+pub struct InputSpec {
+    pub name: String,
+    pub role: Role,
+    pub ty: TensorElementType,
+    /// 声明的形状，-1 表示符号维
+    pub dims: Vec<i64>,
+}
+
+impl InputSpec {
+    pub fn of(name: &str, dtype: &ValueType) -> Option<Self> {
+        match dtype {
+            ValueType::Tensor { ty, shape, .. } => Some(Self {
+                name: name.to_string(),
+                role: classify(name, *ty),
+                ty: *ty,
+                dims: shape.to_vec(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// 把符号维实例化：具体维照抄声明，-1 按角色填 frames / 音频长度 / 1。
+    pub fn shape(&self, frames: usize, audio_len: usize) -> Vec<i64> {
+        let n = self.dims.len();
+        let mut out = self.dims.clone();
+        for (i, d) in out.iter_mut().enumerate() {
+            if *d > 0 {
+                continue;
+            }
+            let last = i + 1 == n;
+            *d = match self.role {
+                Role::Phone => {
+                    if last {
+                        FEAT_DIM as i64
+                    } else if i + 2 == n {
+                        frames as i64
+                    } else {
+                        1
+                    }
+                }
+                Role::PhoneLen | Role::Sid | Role::Scalar => 1,
+                Role::Audio | Role::Mask => {
+                    if last {
+                        audio_len as i64
+                    } else {
+                        1
+                    }
+                }
+                // Pitch / NsfF0 / Noise / Unknown：最后一维是时间轴
+                _ => {
+                    if last {
+                        frames as i64
+                    } else {
+                        1
+                    }
+                }
+            };
+        }
+        if out.is_empty() {
+            out.push(1); // 标量输入
+        }
+        out
+    }
+
+    /// `padding_mask` 在 fairseq 语义里 True = 该位置是填充，整段都是真音频时必须全 False；
+    /// `attention_mask` 语义相反（1 = 有效）。搞反了 HuBERT 会输出垃圾。
+    fn mask_is_padding(&self) -> bool {
+        self.name.to_lowercase().contains("padding")
+    }
+}
+
+/// 一个块的全部原料。
+pub struct BlockData<'a> {
+    pub phone: &'a [f32],
+    pub pitch: &'a [i64],
+    pub nsff0: &'a [f32],
+    pub sid: i64,
+    pub audio: &'a [f32],
+    pub noise: &'a [f32],
+    pub frames: usize,
+}
+
+fn fit_f32(src: &[f32], n: usize, name: &str, warn: &mut Option<String>) -> Vec<f32> {
+    if src.len() == n {
+        return src.to_vec();
+    }
+    if warn.is_none() {
+        *warn = Some(format!("输入 {name} 需要 {n} 个元素，实际只有 {}，已补零/截断", src.len()));
+    }
+    let mut v = vec![0.0f32; n];
+    let k = src.len().min(n);
+    v[..k].copy_from_slice(&src[..k]);
+    v
+}
+
+/// 按 spec 的声明类型与形状生成张量。
+pub fn build_input(spec: &InputSpec, d: &BlockData, warn: &mut Option<String>) -> Result<DynValue> {
+    let shape = spec.shape(d.frames, d.audio.len());
+    let n: usize = shape.iter().map(|x| (*x).max(1) as usize).product();
+
+    // 该角色对应的 f32 原料
+    let floats = |role: Role, warn: &mut Option<String>| -> Vec<f32> {
+        match role {
+            Role::Phone => fit_f32(d.phone, n, &spec.name, warn),
+            Role::NsfF0 => fit_f32(d.nsff0, n, &spec.name, warn),
+            Role::Noise => fit_f32(d.noise, n, &spec.name, warn),
+            Role::Audio => fit_f32(d.audio, n, &spec.name, warn),
+            Role::Mask => vec![if spec.mask_is_padding() { 0.0 } else { 1.0 }; n],
+            Role::Pitch | Role::PhoneLen | Role::Sid => {
+                let v = match role {
+                    Role::Pitch => d.pitch.first().copied().unwrap_or(0) as f32,
+                    Role::PhoneLen => d.frames as f32,
+                    _ => d.sid as f32,
+                };
+                vec![v; n]
+            }
+            Role::Scalar | Role::Unknown => vec![scalar_default(&spec.name) as f32; n],
+        }
+    };
+    let ints = |role: Role, warn: &mut Option<String>| -> Vec<i64> {
+        match role {
+            Role::Pitch => fit_i64(d.pitch, n, &spec.name, warn),
+            Role::PhoneLen => vec![d.frames as i64; n],
+            Role::Sid => vec![d.sid; n],
+            Role::Mask => vec![if spec.mask_is_padding() { 0 } else { 1 }; n],
+            _ => vec![scalar_default(&spec.name) as i64; n],
+        }
+    };
+
+    match spec.ty {
+        TensorElementType::Float32 => Ok(Tensor::from_array((shape, floats(spec.role, warn)))?.into_dyn()),
+        TensorElementType::Float64 => {
+            let v: Vec<f64> = floats(spec.role, warn).into_iter().map(|x| x as f64).collect();
+            Ok(Tensor::from_array((shape, v))?.into_dyn())
+        }
+        TensorElementType::Int64 => Ok(Tensor::from_array((shape, ints(spec.role, warn)))?.into_dyn()),
+        TensorElementType::Int32 => {
+            let v: Vec<i32> = ints(spec.role, warn).into_iter().map(|x| x as i32).collect();
+            Ok(Tensor::from_array((shape, v))?.into_dyn())
+        }
+        TensorElementType::Bool => {
+            let pad = spec.mask_is_padding();
+            let v = vec![matches!(spec.role, Role::Mask) && !pad; n];
+            Ok(Tensor::from_array((shape, v))?.into_dyn())
+        }
+        other => bail!("输入 {} 的类型 {:?} 暂不支持", spec.name, other),
+    }
+}
+
+fn fit_i64(src: &[i64], n: usize, name: &str, warn: &mut Option<String>) -> Vec<i64> {
+    if src.len() == n {
+        return src.to_vec();
+    }
+    if warn.is_none() {
+        *warn = Some(format!("输入 {name} 需要 {n} 个元素，实际只有 {}，已补零/截断", src.len()));
+    }
+    let mut v = vec![0i64; n];
+    let k = src.len().min(n);
+    v[..k].copy_from_slice(&src[..k]);
+    v
+}
+
+/// 极简 xorshift，避免为了填 `rnd` 引入 rand 依赖（每块 ~10k 个 float，纳秒级）。
+pub struct NoiseGen {
+    state: u32,
+    buf: Vec<f32>,
+}
+
+impl NoiseGen {
+    pub fn new() -> Self {
+        Self { state: 0x9E37_79B9, buf: Vec::new() }
+    }
+    /// 生成 `n` 个近似标准正态的样本（4 个均匀分布求和 - 2，够 RVC 的 flow 用）
+    pub fn fill(&mut self, n: usize) -> &[f32] {
+        self.buf.clear();
+        self.buf.reserve(n);
+        for _ in 0..n {
+            let mut acc = 0.0f32;
+            for _ in 0..4 {
+                self.state ^= self.state << 13;
+                self.state ^= self.state >> 17;
+                self.state ^= self.state << 5;
+                acc += (self.state as f32) / 2147483648.0 - 1.0;
+            }
+            self.buf.push(acc * 0.5);
+        }
+        &self.buf
+    }
+}
+
+/// 打印解析结果，方便用户排查“我的模型为什么跑不起来”。
+pub fn log_plan(tag: &str, specs: &[InputSpec]) {
+    for s in specs {
+        logger::log(&format!(
+            "[{tag}] 输入 {:<16} 角色={:<9} 类型={:?} 声明形状={:?}",
+            s.name,
+            format!("{:?}", s.role),
+            s.ty,
+            s.dims
+        ));
+    }
+    let unknown: Vec<&str> = specs.iter().filter(|s| s.role == Role::Unknown).map(|s| s.name.as_str()).collect();
+    if !unknown.is_empty() {
+        logger::log(&format!(
+            "[{tag}] ⚠️ 无法识别的输入 {unknown:?}：将按声明形状填 0（或用常见默认值）。\
+             如果模型输出异常，多半是这里——请把上面几行 [输入] 日志发给开发者。"
+        ));
+    }
+}
+// ─────────────────────────── HuBERT / ContentVec ───────────────────────────
 
 pub struct HubertExtractor {
     session: Session,
+    specs: Vec<InputSpec>,
     /// 归一化后的输入缓冲，复用避免每块分配
     buf: Vec<f32>,
+    /// 有些导出对 16k 输入长度很挑剔（fairseq 的 conv 栈每 320 样本出一帧，
+    /// mask 长度却按另一套取整算，差 1 就在 attention 的 Where 节点上广播失败）。
+    /// 实测 MidFord327/Hubert-Base-ONNX：L=8960 失败、L=9280 成功。
+    /// 这里记录「需要在末尾补多少个零」，第一次扫出来之后就固定用，不再每块重试。
+    pad_extra: usize,
+    swept: bool,
 }
 
 impl HubertExtractor {
     pub fn new(session: Session) -> Self {
-        Self { session, buf: Vec::new() }
+        let specs = session
+            .inputs()
+            .iter()
+            .filter_map(|i| InputSpec::of(i.name(), i.dtype()))
+            .collect::<Vec<_>>();
+        log_plan("HuBERT", &specs);
+        Self { session, specs, buf: Vec::new(), pad_extra: 0, swept: false }
     }
 
     /// 返回展平的内容特征，长度是 `FEAT_DIM` 的整数倍（帧数 = len / 768，约 50fps）。
@@ -392,36 +741,59 @@ impl HubertExtractor {
             }
         }
 
-        let len = self.buf.len() as i64;
-        let mut inputs: Vec<(String, DynValue)> = Vec::with_capacity(self.session.inputs().len());
-        for input in self.session.inputs().iter() {
-            let name = input.name().to_lowercase();
-            if name.contains("feats")
-                || name.contains("source")
-                || name.contains("input_values")
-                || name.contains("hubert")
-                || name == "input"
-                || name == "audio"
-            {
-                inputs.push((
-                    input.name().to_string(),
-                    Tensor::from_array((vec![1, 1, len], self.buf.clone()))?.into_dyn(),
-                ));
-            } else if name.contains("mask") {
-                inputs.push((
-                    input.name().to_string(),
-                    Tensor::from_array((vec![1, len], vec![1i64; len as usize]))?.into_dyn(),
-                ));
-            } else if name.contains("length") || name.contains("_len") {
-                inputs.push((
-                    input.name().to_string(),
-                    Tensor::from_array((vec![1], vec![len]))?.into_dyn(),
-                ));
+        if self.specs.is_empty() {
+            bail!("模型没有声明任何输入");
+        }
+        let base_len = self.buf.len();
+        // 已经扫过就直接用记住的补零量；没扫过则最多按 320 递增试 6 次
+        let tries: usize = if self.swept { 1 } else { 6 };
+        let start = self.pad_extra;
+        let mut last_err = String::new();
+        for k in 0..tries {
+            let attempt = start + k * 320;
+            self.buf.resize(base_len + attempt, 0.0);
+            match self.run_once() {
+                Ok(v) => {
+                    if attempt != self.pad_extra {
+                        logger::log(&format!(
+                            "[HuBERT] 该模型要求 16k 输入补零 +{attempt} 样本（{} 帧）才能跑通，已记住；                             窗口对应的 16k 长度是 {base_len}",
+                            attempt / 320
+                        ));
+                        self.pad_extra = attempt;
+                    }
+                    self.swept = true;
+                    return Ok(v);
+                }
+                Err(e) => last_err = format!("{e:#}"),
             }
         }
-        if inputs.is_empty() {
-            bail!("no recognizable audio input (names: {:?})",
-                self.session.inputs().iter().map(|i| i.name().to_string()).collect::<Vec<_>>());
+        self.swept = true;
+        bail!("HuBERT 推理失败（已尝试补零 0..{}）: {last_err}", (tries - 1) * 320);
+    }
+
+    /// 用 `self.buf` 当前的内容跑一次（形状/类型按模型声明装配）。
+    fn run_once(&mut self) -> Result<Vec<f32>> {
+        let audio_len = self.buf.len();
+        let specs = self.specs.clone();
+        let mut warn = None;
+        let mut inputs: Vec<(String, DynValue)> = Vec::with_capacity(specs.len());
+        {
+            let data = BlockData {
+                phone: &[],
+                pitch: &[],
+                nsff0: &[],
+                sid: 0,
+                audio: &self.buf,
+                noise: &[],
+                // HuBERT 的 "length" 类输入指的是采样点数，不是 RVC 帧数
+                frames: audio_len,
+            };
+            for s in specs.iter() {
+                inputs.push((s.name.clone(), build_input(s, &data, &mut warn)?));
+            }
+        }
+        if let Some(w) = warn {
+            logger::log(&format!("[HuBERT] {w}"));
         }
 
         let outputs = self.session.run(inputs)?;
@@ -433,10 +805,9 @@ impl HubertExtractor {
                 }
             }
         }
-        bail!("failed to extract phone features (no [.., 768] output)");
+        bail!("未能取出内容特征（没有长度是 {FEAT_DIM} 整数倍的 f32 输出）");
     }
 }
-
 // ─────────────────────────── RMVPE mel 前端（全缓存）───────────────────────────
 
 const N_FFT: usize = 1024;
@@ -720,70 +1091,117 @@ fn pick_f32_output(outputs: &SessionOutputs, min_len: usize) -> Option<Vec<f32>>
 
 // ─────────────────────────── RVC 合成 ───────────────────────────
 
+/// 加载期探测的结果：这个模型能接受哪些帧数。
+///
+/// 很多社区导出的 RVC onnx **把序列长度写死了**（导出时没开 dynamic axes）。
+/// 实测 `GuraTalkV2.onnx` 只在 T=200 时能跑：它的注意力 Reshape 常量满足
+/// `2T²+199 == 2(T+1)(2T-1)`，而这个等式只有 T=200 成立；换任何别的帧数都会报
+/// `input_shape_size == requested_shape_size was false`。
+/// 这种情况下不能直接判死刑——把窗口撑到 T*480 就能用，而且延迟可以保持不变
+/// （多出来的长度全部塞进 left context，lookahead 与 chunk 不动）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Role {
-    Phone,
-    PhoneLen,
-    Pitch,
-    NsfF0,
-    Sid,
-    Unknown,
-}
-
-fn classify(name: &str) -> Role {
-    let n = name.to_lowercase();
-    // 顺序很重要：phone_lengths 同时含 "phone" 和 "len"
-    if n.contains("len") {
-        return Role::PhoneLen;
-    }
-    if n.contains("nsff0") || (n.contains("nsf") && n.contains("f0")) {
-        return Role::NsfF0;
-    }
-    if n.contains("pitch") {
-        return Role::Pitch;
-    }
-    if n.contains("phone") || n.contains("content") || n.contains("feats") || n.contains("hubert") {
-        return Role::Phone;
-    }
-    if n.contains("sid") || n.contains("speaker") {
-        return Role::Sid;
-    }
-    Role::Unknown
+pub enum ModelShape {
+    /// 帧数动态，任意 chunk 都能用
+    Dynamic { hop: usize },
+    /// 导出时写死了序列长度，只能用 `frames` 帧
+    Fixed { frames: usize, hop: usize },
+    /// 全部候选都失败（多半是签名不兼容），保留错误信息供上层告警
+    Unknown { hop: usize },
 }
 
 pub struct RvcSynth {
     session: Session,
-    /// 预先算好的「输入名 -> 角色」映射，避免每块都做字符串匹配
-    plan: Vec<(String, Role)>,
+    specs: Vec<InputSpec>,
     phone_100: Vec<f32>,
     pitch: Vec<i64>,
     nsff0: Vec<f32>,
+    noise: NoiseGen,
+    /// 模型是否需要 `rnd` 噪声输入（GuraTalkV2 这类导出需要，插件自带的模型不需要）
+    noise_role: bool,
     logged: bool,
 }
 
 impl RvcSynth {
     pub fn new(session: Session) -> Self {
-        let plan: Vec<(String, Role)> = session.inputs().iter().map(|i| (i.name().to_string(), classify(i.name()))).collect();
-        let unknown: Vec<&str> = plan
+        let specs = session
+            .inputs()
             .iter()
-            .filter(|(_, r)| *r == Role::Unknown)
-            .map(|(n, _)| n.as_str())
-            .collect();
-        if !unknown.is_empty() {
-            logger::log(&format!("[RVC] 无法识别的输入名: {:?}（将按位置回退）", unknown));
+            .filter_map(|i| InputSpec::of(i.name(), i.dtype()))
+            .collect::<Vec<_>>();
+        log_plan("RVC", &specs);
+        let noise_role = specs.iter().any(|s| s.role == Role::Noise);
+        Self {
+            session,
+            specs,
+            phone_100: Vec::new(),
+            pitch: Vec::new(),
+            nsff0: Vec::new(),
+            noise: NoiseGen::new(),
+            noise_role,
+            logged: false,
         }
-        Self { session, plan, phone_100: Vec::new(), pitch: Vec::new(), nsff0: Vec::new(), logged: false }
     }
 
     /// `phone_50fps` 是展平的 HuBERT 特征（约 50fps），内部插值到 `frames`（100fps）。
     /// 返回模型输出的原始音频（采样率由调用方按长度推断）。
     pub fn synthesize(&mut self, frames: usize, sid: i64, f0: &[f32], phone_50fps: &[f32]) -> Result<Vec<f32>> {
+        self.run(frames, sid, f0, phone_50fps, false)
+    }
+
+    /// 加载期探测：先用当前配置的帧数试一次，再换一个帧数试，
+    /// 两次都过 = 动态模型；只有特定帧数能过 = 写死了长度，扫一遍常见值找出它。
+    /// 返回值同时带上实测的 hop（= 模型采样率 / 100）。
+    pub fn probe(&mut self, want: usize) -> ModelShape {
+        // 常见「写死长度」的导出：2 秒 @100fps=200、以及 2 的幂附近
+        const CANDIDATES: [usize; 12] = [200, 256, 128, 100, 64, 300, 400, 512, 150, 320, 96, 80];
+        let first = want.clamp(8, 4096);
+        match self.try_frames(first) {
+            Ok(hop) => {
+                let other = if first > 24 { first - 7 } else { first + 7 };
+                match self.try_frames(other) {
+                    Ok(_) => ModelShape::Dynamic { hop },
+                    Err(_) => ModelShape::Fixed { frames: first, hop },
+                }
+            }
+            Err(e) => {
+                for t in CANDIDATES {
+                    if t == first {
+                        continue;
+                    }
+                    if let Ok(hop) = self.try_frames(t) {
+                        logger::log(&format!("[RVC] 探测: 帧数 {first} 失败（{e}），但 {t} 帧可用"));
+                        return ModelShape::Fixed { frames: t, hop };
+                    }
+                }
+                logger::log(&format!("[RVC] 探测: 所有候选帧数都失败，最后一次错误: {e}"));
+                ModelShape::Unknown { hop: HOP_48K }
+            }
+        }
+    }
+
+    /// 用全零特征试跑一次，成功则返回实测 hop（= 输出样本数 / 帧数）。
+    fn try_frames(&mut self, frames: usize) -> Result<usize, String> {
+        if frames < 2 {
+            return Err("frames < 2".into());
+        }
+        let phone = vec![0.0f32; FEAT_DIM * (frames / 2).max(2)];
+        let f0 = vec![0.0f32; frames];
+        let audio = self.run(frames, 0, &f0, &phone, true).map_err(|e| format!("{e:#}"))?;
+        if audio.is_empty() {
+            return Err("输出为空".into());
+        }
+        Ok(audio.len() / frames)
+    }
+
+    fn run(&mut self, frames: usize, sid: i64, f0: &[f32], phone_50fps: &[f32], quiet: bool) -> Result<Vec<f32>> {
         let frames_50 = phone_50fps.len() / FEAT_DIM;
         if frames_50 == 0 {
-            bail!("hubert features empty");
+            // v1.0 在这里会 panic（frames_50 == 0 ⇒ 索引越界），panic 被 catch_unwind 吃掉后
+            // worker 线程直接退出 ⇒ 插件从此永久静音。改成返回错误。
+            bail!("HuBERT 特征为空");
         }
         if f0.len() < frames {
-            bail!("f0 too short: {} < {}", f0.len(), frames);
+            bail!("f0 长度不足: {} < {frames}", f0.len());
         }
 
         // 50fps -> 100fps 线性插值（复用缓冲，不每块分配）
@@ -808,46 +1226,44 @@ impl RvcSynth {
         self.nsff0.clear();
         self.nsff0.extend_from_slice(&f0[..frames]);
 
-        // 按名字装配；名字全都对不上时按标准顺序回退
-        let named: usize = self.plan.iter().filter(|(_, r)| *r != Role::Unknown).count();
-        let mut inputs: Vec<(String, DynValue)> = Vec::with_capacity(self.plan.len());
-        if named > 0 {
-            for (name, role) in self.plan.iter() {
-                let value: DynValue = match role {
-                    Role::Phone => Tensor::from_array((vec![1, frames as i64, FEAT_DIM as i64], self.phone_100.clone()))?.into_dyn(),
-                    Role::PhoneLen => Tensor::from_array((vec![1], vec![frames as i64]))?.into_dyn(),
-                    Role::Pitch => Tensor::from_array((vec![1, frames as i64], self.pitch.clone()))?.into_dyn(),
-                    Role::NsfF0 => Tensor::from_array((vec![1, frames as i64], self.nsff0.clone()))?.into_dyn(),
-                    Role::Sid => Tensor::from_array((vec![1], vec![sid]))?.into_dyn(),
-                    Role::Unknown => continue,
-                };
-                inputs.push((name.clone(), value));
-            }
-        } else {
-            // 标准 RVC 导出顺序：phone, phone_lengths, pitch, nsff0, sid
-            let order = [Role::Phone, Role::PhoneLen, Role::Pitch, Role::NsfF0, Role::Sid];
-            for (idx, role) in order.iter().enumerate() {
-                let Some(name) = self.plan.get(idx).map(|(n, _)| n.clone()) else { break };
-                let value: DynValue = match role {
-                    Role::Phone => Tensor::from_array((vec![1, frames as i64, FEAT_DIM as i64], self.phone_100.clone()))?.into_dyn(),
-                    Role::PhoneLen => Tensor::from_array((vec![1], vec![frames as i64]))?.into_dyn(),
-                    Role::Pitch => Tensor::from_array((vec![1, frames as i64], self.pitch.clone()))?.into_dyn(),
-                    Role::NsfF0 => Tensor::from_array((vec![1, frames as i64], self.nsff0.clone()))?.into_dyn(),
-                    Role::Sid => Tensor::from_array((vec![1], vec![sid]))?.into_dyn(),
-                    Role::Unknown => continue,
-                };
-                inputs.push((name, value));
+        let specs = self.specs.clone();
+        if specs.is_empty() {
+            bail!("模型没有声明任何输入");
+        }
+        let mut warn = None;
+        let mut inputs: Vec<(String, DynValue)> = Vec::with_capacity(specs.len());
+        {
+            // 需要 rnd 的模型每块重新生成噪声（RVC 的 flow 解码器靠它产生音色细节）
+            let noise_slice: &[f32] = if self.noise_role {
+                let n = specs
+                    .iter()
+                    .find(|s| s.role == Role::Noise)
+                    .map(|s| s.shape(frames, 0).iter().map(|x| (*x).max(1) as usize).product())
+                    .unwrap_or(0);
+                self.noise.fill(n)
+            } else {
+                &[]
+            };
+            let data = BlockData {
+                phone: &self.phone_100,
+                pitch: &self.pitch,
+                nsff0: &self.nsff0,
+                sid,
+                audio: &[],
+                noise: noise_slice,
+                frames,
+            };
+            for s in specs.iter() {
+                inputs.push((s.name.clone(), build_input(s, &data, &mut warn)?));
             }
         }
-        if inputs.is_empty() {
-            bail!("model declares no usable inputs");
+        if let Some(w) = warn {
+            logger::log(&format!("[RVC] {w}"));
         }
 
         let outputs = self.session.run(inputs)?;
-        let audio = pick_f32_output(&outputs, frames)
-            .ok_or_else(|| anyhow::anyhow!("RVC: no audio output"))?;
-        let audio = audio.as_slice();
-        if !self.logged {
+        let audio = pick_f32_output(&outputs, frames).ok_or_else(|| anyhow::anyhow!("RVC: 没有音频输出"))?;
+        if !quiet && !self.logged {
             self.logged = true;
             logger::log(&format!(
                 "[RVC] 首块成功: frames={frames} 输出样本={} 推断hop={}",
@@ -855,7 +1271,7 @@ impl RvcSynth {
                 audio.len() / frames.max(1)
             ));
         }
-        Ok(audio.to_vec())
+        Ok(audio)
     }
 }
 
@@ -873,7 +1289,6 @@ pub fn f0_coarse(f: f32) -> i64 {
     }
     x.round().clamp(1.0_f32, 255.0_f32) as i64
 }
-
 // ─────────────────────────── 重采样（非 48k 模型兜底）───────────────────────────
 
 /// 模型输出采样率不是 48kHz 时（例如 40k 模型 hop=400、32k 模型 hop=320），

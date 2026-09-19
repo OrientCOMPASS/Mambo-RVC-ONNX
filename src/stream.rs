@@ -225,13 +225,45 @@ struct Engine {
     f0: F0Extractor,
     rvc: RvcSynth,
     set: rvc::ModelSet,
+    /// 加载期探测结果：模型是否写死了帧数、实测 hop 是多少
+    shape: rvc::ModelShape,
+}
+
+/// 模型写死了帧数时，把窗口撑到 `frames * 480`。
+///
+/// 多出来的长度**全部塞进 left context**，`block` 与 `lookahead` 一动不动 ⇒
+/// 端到端延迟（≈ lookahead + block + crossfade）完全不变，只是每块的算力变多。
+/// 这是能同时满足「用得上这个模型」和「延迟不爆炸」的唯一解。
+fn fit_fixed_frames(mut g: Geometry, shape: rvc::ModelShape) -> Geometry {
+    let frames = match shape {
+        rvc::ModelShape::Fixed { frames, .. } => frames,
+        _ => return g,
+    };
+    let need = frames * HOP_48K;
+    if need >= g.block + g.lookahead {
+        g.left = need - g.block - g.lookahead;
+    } else {
+        // 模型要求的窗口比 chunk+lookahead 还短：只能压缩这两者，延迟会跟着降
+        g.lookahead = (need / 3).max(HOP_48K);
+        g.block = need.saturating_sub(g.lookahead).max(HOP_48K);
+        g.left = need.saturating_sub(g.block + g.lookahead);
+    }
+    g.window = g.left + g.block + g.lookahead;
+    g.frames = g.window / HOP_48K;
+    g.crossfade = g.crossfade.min(g.block / 2).min(g.lookahead).min(g.left);
+    g
 }
 
 impl Engine {
     /// 用已经解析好的 `rvc::ModelSet` 建三个会话。
     /// 分开 discover / load 是为了在「配置变了但解析出的模型路径没变」时跳过重载
     /// （重载要 1~3 秒，期间输出会断流，不能白断）。
-    fn load_from(set: rvc::ModelSet, plugin_dir: &PathBuf, status: &SharedStatus) -> anyhow::Result<Self> {
+    fn load_from(
+        set: rvc::ModelSet,
+        plugin_dir: &PathBuf,
+        frames_hint: usize,
+        status: &SharedStatus,
+    ) -> anyhow::Result<Self> {
         publish(status, |s| {
             s.phase = Phase::Loading;
             s.model_label = set.rvc_label.clone();
@@ -244,7 +276,6 @@ impl Engine {
         let load = |path: &PathBuf, tag: &str, detail: &mut String| -> anyhow::Result<ort::session::Session> {
             match rvc::load_session(&path.to_string_lossy(), false) {
                 Ok(s) => {
-                    rvc::log_inputs(tag, &s);
                     Ok(s)
                 }
                 Err(e) => {
@@ -254,7 +285,6 @@ impl Engine {
                     let s = rvc::load_session(&path.to_string_lossy(), true).map_err(|e2| {
                         anyhow::anyhow!("{tag} 加载失败 {}\n  CPU 回退也失败: {e2}", path.display())
                     })?;
-                    rvc::log_inputs(tag, &s);
                     Ok(s)
                 }
             }
@@ -262,7 +292,29 @@ impl Engine {
 
         let hubert = HubertExtractor::new(load(&set.hubert, "HuBERT", &mut detail)?);
         let f0 = F0Extractor::new(load(&set.rmvpe, "RMVPE", &mut detail)?);
-        let rvc = RvcSynth::new(load(&set.rvc, "RVC", &mut detail)?);
+        let mut rvc = RvcSynth::new(load(&set.rvc, "RVC", &mut detail)?);
+
+        // ── 加载期探测：这个模型能吃哪些帧数？hop 是多少（=> 采样率）？──
+        let shape = rvc.probe(frames_hint);
+        match shape {
+            rvc::ModelShape::Dynamic { hop } => logger::log(&format!(
+                "[RVC] 探测: 帧数动态 ✓ 可用任意 chunk；hop={hop} => 模型采样率 {}Hz{}",
+                hop * 100,
+                if hop == HOP_48K { "" } else { "（≠48000，输出会自动重采样）" }
+            )),
+            rvc::ModelShape::Fixed { frames, hop } => logger::log(&format!(
+                "[RVC] 探测: ⚠️ 该模型导出时写死了序列长度，只有 {frames} 帧能用（= {:.0}ms @48k）。\n\
+                 \x20      插件会把窗口自动撑到 {frames} 帧：多出来的部分全部放进 left context，\n\
+                 \x20      chunk 与 lookahead 不变 ⇒ 延迟不受影响，但每块算力会增加。\n\
+                 \x20      hop={hop} => 模型采样率 {}Hz。想要更省算力，请用 dynamic axes 重新导出模型。",
+                frames as f32 * 10.0,
+                hop * 100
+            )),
+            rvc::ModelShape::Unknown { hop } => logger::log(&format!(
+                "[RVC] 探测: ⚠️ 所有候选帧数都失败了（hop 假定 {hop}）。仍会继续尝试真实推理，\n\
+                 \x20      每块的失败原因会记在日志里。多半是输入签名不兼容，请把 [RVC] 输入 ... 那几行发给开发者。"
+            )),
+        }
 
         publish(status, |s| {
             s.phase = Phase::Ready;
@@ -278,7 +330,7 @@ impl Engine {
         if set.rvc_source == rvc::Source::Bundled {
             logger::log("[Model] 未发现用户模型，正在使用插件自带模型。想用自己的音色：把 .onnx 放进 user_models/，或在设置的 model_file 里填相对路径");
         }
-        Ok(Self { hubert, f0, rvc, set })
+        Ok(Self { hubert, f0, rvc, set, shape })
     }
 }
 
@@ -326,14 +378,24 @@ struct Geometry {
 impl Geometry {
     fn new(p: &config::Params, sr: usize) -> Self {
         let snap = |ms: u32| -> usize { ((ms + 5) / 10 * 10) as usize * sr / 1000 };
-        let left = snap(p.left_context_ms);
+        let mut left = snap(p.left_context_ms);
         let block = snap(p.chunk_ms).max(HOP_48K);
         let lookahead = snap(p.lookahead_ms);
         let crossfade = snap(p.crossfade_ms)
             .min(block / 2)
             .min(lookahead)
             .min(left);
+
+        // HuBERT 的特征提取器每 320 个 16kHz 样本出一帧，而 mask 长度是另一套取整，
+        // 两者差 1 就会在 self_attn 的 Where 节点上报「Attempting to broadcast ... 27 by 28」。
+        // 窗口对应的 16k 长度 = window/3，要它是 320 的整数倍 <=> window 是 960 的整数倍。
+        // 补齐的量全部加到 left 上 ⇒ block 与 lookahead 不动 ⇒ **端到端延迟完全不变**。
+        let rem = (left + block + lookahead) % (HOP_48K * 2);
+        if rem != 0 {
+            left += HOP_48K * 2 - rem;
+        }
         let window = left + block + lookahead;
+        let crossfade = crossfade.min(left);
         Self {
             left,
             block,
@@ -410,11 +472,13 @@ fn worker_main(sample_rate: usize, h: WorkerHandles) {
     let mut win16k: Vec<f32> = Vec::new();
     let mut rendered: Vec<f32> = Vec::new();
     let mut out_chunk: Vec<f32> = Vec::new();
-    let mut tail: Vec<f32> = Vec::new();
-    let mut fade_in: Vec<f32> = Vec::new();
-    let mut fade_out: Vec<f32> = Vec::new();
     let mut geom = Geometry::new(&config::Params::load(), sample_rate);
-    let mut ola_valid = false;
+    // ★ 淡化曲线必须在构造时就按 crossfade 建好。
+    //   v1.1 的第一版把它放在「几何参数变化」的分支里，而 geom 的初值就是用同一份参数算的，
+    //   首次进循环时 new_geom == geom ⇒ 曲线永远是空 Vec ⇒ 第三块（第一次真正走混合分支）
+    //   直接 panic: index out of bounds: the len is 0 but the index is 0，worker 线程当场死掉。
+    //   现在曲线长度由 Ola 的构造函数保证，类型层面就没法漏。
+    let mut ola = Ola::new(geom.crossfade);
     let mut need_prime = true;
     let mut last_resync = h.resync.load(Ordering::Relaxed);
 
@@ -442,12 +506,13 @@ fn worker_main(sample_rate: usize, h: WorkerHandles) {
                 logger::log("[Model] 配置变了但解析出的模型路径没变，跳过热重载");
                 loaded_epoch = epoch;
             } else {
-                match Engine::load_from(want, &plugin_dir, &h.status) {
+                let frames_hint = Geometry::new(&config::Params::load(), sample_rate).frames;
+                match Engine::load_from(want, &plugin_dir, frames_hint, &h.status) {
                     Ok(e) => {
                         engine = Some(e);
                         loaded_epoch = epoch;
                         history.clear();
-                        ola_valid = false;
+                        ola.invalidate();
                         need_prime = true;
                         // 换模型了：别让旧音色的残留音频继续播出去
                         h.flush_out.store(true, Ordering::Release);
@@ -495,7 +560,7 @@ fn worker_main(sample_rate: usize, h: WorkerHandles) {
 
         // ── 参数快照（每批一次，实时线程不参与）──
         let params = config::Params::load();
-        let new_geom = Geometry::new(&params, sample_rate);
+        let new_geom = fit_fixed_frames(Geometry::new(&params, sample_rate), engine.shape);
         if new_geom != geom {
             logger::log(&format!(
                 "[Geom] 窗口变更: left={}ms block={}ms lookahead={}ms crossfade={}ms (window={}ms, 延迟≈{}ms, 算力≈{:.1}x)",
@@ -513,17 +578,17 @@ fn worker_main(sample_rate: usize, h: WorkerHandles) {
                 let drop = history.len() - geom.window;
                 history.drain(..drop);
             }
-            ola_valid = false;
+            ola.invalidate();
+            ola.set_crossfade(geom.crossfade);
             need_prime = true;
             h.flush_out.store(true, Ordering::Release);
-            rebuild_fades(&mut fade_in, &mut fade_out, geom.crossfade);
         }
 
         // ── 音频线程丢过输入 ⇒ history 里有空洞，OLA 必须断开 ──
         let resync = h.resync.load(Ordering::Relaxed);
         if resync != last_resync {
             last_resync = resync;
-            ola_valid = false;
+            ola.invalidate();
             need_prime = true;
             logger::log("[Worker] 输入环溢出，已复位 OLA（时间轴出现空洞）");
         }
@@ -538,7 +603,7 @@ fn worker_main(sample_rate: usize, h: WorkerHandles) {
             let keep = geom.window.saturating_sub(geom.block);
             let dropped = history.len() - keep;
             history.drain(..dropped);
-            ola_valid = false;
+            ola.invalidate();
             need_prime = true;
             if let Ok(mut s) = h.status.lock() {
                 s.flushes += 1;
@@ -554,14 +619,13 @@ fn worker_main(sample_rate: usize, h: WorkerHandles) {
         }
 
         // ── 逐块渲染 ──
+        ola.set_crossfade(geom.crossfade);
         let gate_rms = params.gate_rms();
         let jitter = (params.jitter_ms as usize + 5) / 10 * 10 * sample_rate / 1000;
         win16k.clear();
         win16k.resize(geom.window / 3, 0.0);
         out_chunk.clear();
         out_chunk.resize(geom.block, 0.0);
-        tail.clear();
-        tail.resize(geom.crossfade, 0.0);
 
         // 游标式推进：一批里可能要渲染 k 个窗口，用 cursor 走完后只做一次 drain。
         // （1.0 是每块 drain 一次，k 块就是 k 次 O(len) memmove，积压时白白烧 CPU。）
@@ -592,22 +656,17 @@ fn worker_main(sample_rate: usize, h: WorkerHandles) {
             };
 
             let chunk_result: Result<(), String> = if body_rms < gate_rms {
-                // 静音块：不跑推理（省下算力，也让句间停顿能自动把积压排干）
-                for s in out_chunk.iter_mut() {
-                    *s = 0.0;
-                }
-                if ola_valid {
-                    let cf = geom.crossfade;
-                    for i in 0..cf {
-                        out_chunk[i] = tail[i] * fade_out[i];
-                    }
-                }
-                for s in tail.iter_mut() {
-                    *s = 0.0;
-                }
+                // 静音块：不跑推理（省算力，也让句间停顿能自动把积压排干）
+                ola.emit_silence(geom, &mut out_chunk);
                 Ok(())
             } else {
-                render_block(engine, &params, geom, &win16k, &mut rendered, &mut out_chunk, &mut tail, ola_valid, &fade_in, &fade_out)
+                match render_window(engine, &params, geom, &win16k, &mut rendered) {
+                    Ok(()) => {
+                        ola.emit(geom, &rendered, &mut out_chunk);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
             };
 
             let tau = t0.elapsed();
@@ -623,7 +682,6 @@ fn worker_main(sample_rate: usize, h: WorkerHandles) {
                         need_prime = false;
                     }
                     let _ = h.output_rb.push(&out_chunk);
-                    ola_valid = true;
                 }
                 Err(reason) => {
                     // 失败也必须照常推进游标：1.0 在这里 `continue`，跳过了 drain，
@@ -634,10 +692,7 @@ fn worker_main(sample_rate: usize, h: WorkerHandles) {
                         *s = 0.0;
                     }
                     let _ = h.output_rb.push(&out_chunk);
-                    for s in tail.iter_mut() {
-                        *s = 0.0;
-                    }
-                    ola_valid = false;
+                    ola.invalidate();
                     need_prime = true;
                 }
             }
@@ -689,36 +744,111 @@ fn worker_main(sample_rate: usize, h: WorkerHandles) {
     logger::log("[Worker] 线程退出");
 }
 
-fn rebuild_fades(fade_in: &mut Vec<f32>, fade_out: &mut Vec<f32>, cf: usize) {
-    fade_in.clear();
-    fade_out.clear();
-    if cf == 0 {
-        return;
+/// OLA（重叠相加）拼接状态。
+///
+/// 把「淡化曲线长度必须等于 crossfade」「tail 必须与下一块的 head 对齐」这两条不变量
+/// 收进构造函数与 `set_crossfade`，避免出现「忘了初始化就索引」这类只在第三块才炸的 bug。
+struct Ola {
+    cf: usize,
+    /// 上一块渲染结果里、紧跟在本块 head 之前的那 crossfade 个样本
+    tail: Vec<f32>,
+    fade_in: Vec<f32>,
+    fade_out: Vec<f32>,
+    /// tail 是否真的对应「上一块的紧邻后续」。任何时间轴断裂（积压 flush / 换模型 /
+    /// 输入环溢出 / 参数变化 / 推理失败）都必须置 false，否则会把两段无关音频混在一起。
+    valid: bool,
+}
+
+impl Ola {
+    fn new(cf: usize) -> Self {
+        let mut o = Self { cf: 0, tail: Vec::new(), fade_in: Vec::new(), fade_out: Vec::new(), valid: false };
+        o.set_crossfade(cf);
+        o
     }
-    fade_in.reserve(cf);
-    fade_out.reserve(cf);
-    for i in 0..cf {
-        // 等功率（raised-cosine）淡化，拼接处能量不塌
-        let v = 0.5 * (1.0 - (std::f32::consts::PI * i as f32 / cf as f32).cos());
-        fade_in.push(v);
-        fade_out.push(1.0 - v);
+
+    /// 改交叉淡化长度。长度没变就什么都不做（每批都会调，必须幂等且廉价）。
+    fn set_crossfade(&mut self, cf: usize) {
+        if cf == self.cf && self.fade_in.len() == cf && self.tail.len() == cf {
+            return;
+        }
+        self.cf = cf;
+        // raised-cosine **幅度**淡化：fade_in + fade_out ≡ 1。
+        // 这里刻意不用等功率（sin/cos）：tail 与 head 是**同一段绝对时间**在两个不同上下文窗口下的
+        // 两次渲染，高度相关；相关信号用幅度互补才能保持电平恒定，等功率会在中点抬高 +3dB。
+        self.fade_in = (0..cf)
+            .map(|i| 0.5 * (1.0 - (std::f32::consts::PI * i as f32 / cf.max(1) as f32).cos()))
+            .collect();
+        self.fade_out = self.fade_in.iter().map(|v| 1.0 - v).collect();
+        self.tail = vec![0.0; cf];
+        self.valid = false;
+    }
+
+    /// 时间轴断裂：丢掉过期尾巴，下一块直接用本窗口的 head，不与旧音频混合。
+    fn invalidate(&mut self) {
+        self.valid = false;
+        for s in self.tail.iter_mut() {
+            *s = 0.0;
+        }
+    }
+
+    /// 静音块：把上一块的尾巴淡出，其余填 0。
+    fn emit_silence(&mut self, geom: Geometry, out: &mut [f32]) {
+        for s in out.iter_mut() {
+            *s = 0.0;
+        }
+        let n = self.cf.min(geom.crossfade).min(out.len());
+        if self.valid && self.fade_out.len() >= n && self.tail.len() >= n {
+            for i in 0..n {
+                out[i] = self.tail[i] * self.fade_out[i];
+            }
+        }
+        for s in self.tail.iter_mut() {
+            *s = 0.0;
+        }
+        self.valid = true; // 全 0 的尾巴与下一块的 head 仍然对齐
+    }
+
+    /// 正常块：`out[i] = rendered[out_start + i]`，前 cf 个样本与上一块的尾巴做等功率交叉淡化。
+    ///
+    /// 为什么 tail 和 head 是同一段绝对时间：上一块的 tail 覆盖
+    /// `[base+left+block-cf, base+left+block)`，本块（base' = base + block）的 head 覆盖
+    /// `[base'+left-cf, base'+left)` = `[base+left-cf+block, base+left+block)` ⇒ 完全重合 ✓
+    /// （这正是 v1.0 做不到的：它的窗口锚在尾部，base 前进时窗口末端不动，tail/head 差了整整一个 block。）
+    fn emit(&mut self, geom: Geometry, rendered: &[f32], out: &mut [f32]) {
+        let cf = self.cf.min(geom.crossfade).min(out.len());
+        let os = geom.out_start();
+        let ts = geom.tail_start();
+        if rendered.len() < os + geom.block || rendered.len() < ts + cf {
+            // 理论上不会发生（调用方已校验长度）；真发生了就退化成填 0，绝不越界 panic
+            for s in out.iter_mut() {
+                *s = 0.0;
+            }
+            self.invalidate();
+            return;
+        }
+        if cf > 0 && self.valid && self.fade_in.len() >= cf && self.tail.len() >= cf {
+            for i in 0..cf {
+                out[i] = self.tail[i] * self.fade_out[i] + rendered[os + i] * self.fade_in[i];
+            }
+        } else if cf > 0 {
+            out[..cf].copy_from_slice(&rendered[os..os + cf]);
+        }
+        out[cf..].copy_from_slice(&rendered[os + cf..os + geom.block]);
+        if self.tail.len() == cf && cf > 0 {
+            self.tail.copy_from_slice(&rendered[ts..ts + cf]);
+        }
+        self.valid = true;
     }
 }
 
-/// 渲染一个块：HuBERT → RMVPE → 变调 → RVC →（必要时重采样）→ OLA 拼接。
-/// 结果写进 `out_chunk`（block 个样本）与 `tail`（crossfade 个样本）。
-#[allow(clippy::too_many_arguments)]
-fn render_block(
+/// 渲染一个窗口：HuBERT → RMVPE → 变调 → RVC →（必要时重采样）。
+/// 结果写进 `rendered`（geom.window 个 48k 样本），OLA 拼接由 `Ola::emit` 负责。
+fn render_window(
     engine: &mut Engine,
     params: &config::Params,
     geom: Geometry,
     win16k: &[f32],
     rendered: &mut Vec<f32>,
-    out_chunk: &mut [f32],
-    tail: &mut [f32],
-    ola_valid: bool,
-    fade_in: &[f32],
-    fade_out: &[f32],
 ) -> Result<(), String> {
     let phone = engine
         .hubert
@@ -768,22 +898,6 @@ fn render_block(
         return Err(format!("重采样后长度不足: {} < {}", rendered.len(), geom.tail_start() + geom.crossfade));
     }
 
-    // ── OLA 拼接 ──
-    // out_chunk[i] = rendered[out_start + i]，其中前 crossfade 个样本与上一块的 tail 交叉淡化。
-    // 上一块的 tail 覆盖 [base+left+block-cf, base+left+block)，本块的 head 覆盖
-    // [base'+left-cf, base'+left)，而 base' = base + block ⇒ 两者是同一段绝对时间 ✓
-    let cf = geom.crossfade;
-    let out_start = geom.out_start();
-    if cf > 0 && ola_valid {
-        for i in 0..cf {
-            out_chunk[i] = tail[i] * fade_out[i] + rendered[out_start + i] * fade_in[i];
-        }
-    } else {
-        // 第一块，或者 OLA 刚被复位：直接用本窗口的 head，不与过期尾巴混合
-        out_chunk[..cf].copy_from_slice(&rendered[out_start..out_start + cf]);
-    }
-    out_chunk[cf..].copy_from_slice(&rendered[out_start + cf..out_start + geom.block]);
-    tail[..cf].copy_from_slice(&rendered[geom.tail_start()..geom.tail_start() + cf]);
     Ok(())
 }
 
@@ -979,5 +1093,105 @@ mod tests {
         let g3 = Geometry::new(&p, 48_000);
         assert_eq!(g3.crossfade, 0, "left/lookahead 为 0 时交叉淡化必须退化为 0（硬拼接）");
         assert!(g3.out_start() + g3.block <= g3.window);
+    }
+
+    // ══════════════ OLA 状态机 ══════════════
+    //
+    // v1.1 第一版把淡化曲线的构建放在「几何参数变化」分支里，而 geom 的初值就是用同一份
+    // 参数算出来的 ⇒ 首次进循环 new_geom == geom ⇒ 曲线永远是空 Vec ⇒
+    // 第三块（第一次真正走混合分支）panic: index out of bounds: the len is 0 but the index is 0，
+    // worker 线程当场死掉，插件从此永久静音。下面这几个测试把这条不变量钉死。
+
+    #[test]
+    fn ola_new_builds_fade_curves_immediately() {
+        let ola = Ola::new(960);
+        assert_eq!(ola.fade_in.len(), 960, "构造时就必须建好淡化曲线（v1.1 第一版在这里是空的）");
+        assert_eq!(ola.fade_out.len(), 960);
+        assert_eq!(ola.tail.len(), 960);
+        assert!(!ola.valid, "初始状态没有可用的尾巴");
+        assert!(ola.fade_in[0].abs() < 1e-6, "淡入曲线应从 0 开始");
+        assert!(ola.fade_in[959] > 0.99, "淡入曲线应升到 1");
+        assert!((ola.fade_in[480] - 0.5).abs() < 0.01, "中点应为 0.5");
+        for i in 0..960 {
+            // 幅度互补（不是等功率）：tail 与 head 高度相关，互补才能保证电平恒定
+            assert!((ola.fade_in[i] + ola.fade_out[i] - 1.0).abs() < 1e-6, "互补性 @{i}");
+            if i > 0 {
+                assert!(ola.fade_in[i] >= ola.fade_in[i - 1], "淡入必须单调不降 @{i}");
+            }
+        }
+    }
+
+    #[test]
+    fn ola_crossfade_zero_is_safe() {
+        let mut ola = Ola::new(0);
+        assert!(ola.fade_in.is_empty());
+        let g = Geometry { left: 960, block: 480, lookahead: 480, crossfade: 0, window: 1920, frames: 4 };
+        let rendered: Vec<f32> = (0..1920).map(|i| i as f32).collect();
+        let mut out = vec![0.0f32; g.block];
+        ola.emit(g, &rendered, &mut out);
+        // crossfade=0 时应硬拼接：out == rendered[left .. left+block]
+        assert_eq!(out[..], rendered[g.left..g.left + g.block]);
+    }
+
+    #[test]
+    fn ola_emit_advances_exactly_one_block_and_stays_in_bounds() {
+        let g = Geometry { left: 960, block: 480, lookahead: 480, crossfade: 96, window: 1920, frames: 4 };
+        let mut ola = Ola::new(g.crossfade);
+        // 连续 5 个「窗口」，每个都比上一个前移 block，内容用绝对下标标记
+        for k in 0..5usize {
+            let base = k * g.block;
+            let rendered: Vec<f32> = (0..g.window).map(|i| (base + i) as f32).collect();
+            let mut out = vec![0.0f32; g.block];
+            ola.emit(g, &rendered, &mut out);
+            // 输出块覆盖 [base+left-cf, base+left+block-cf)
+            let start = base + g.out_start();
+            if k == 0 {
+                // 第一块 ola.valid == false => 不混合，直接取本窗口的 head
+                for i in 0..g.block {
+                    assert_eq!(out[i], (start + i) as f32, "块 0 位置 {i}");
+                }
+            } else {
+                // 交叉淡化区是「上一块尾巴」与「本块 head」的混合，两者本应是同一段绝对时间，
+                // 所以混合结果仍应落在这段区间内（这正好验证 tail/head 对齐）
+                for i in 0..g.crossfade {
+                    let v = out[i];
+                    let lo = (start + i) as f32;
+                    assert!((v - lo).abs() < 1e-3, "块 {k} 交叉淡化区 {i}: {v} vs {lo}");
+                }
+                for i in g.crossfade..g.block {
+                    assert_eq!(out[i], (start + i) as f32, "块 {k} 位置 {i}");
+                }
+            }
+            assert!(ola.valid);
+        }
+    }
+
+    #[test]
+    fn ola_invalidate_stops_mixing_stale_tail() {
+        let g = Geometry { left: 960, block: 480, lookahead: 480, crossfade: 96, window: 1920, frames: 4 };
+        let mut ola = Ola::new(g.crossfade);
+        let r1: Vec<f32> = (0..g.window).map(|i| 1000.0 + i as f32).collect();
+        let mut out = vec![0.0f32; g.block];
+        ola.emit(g, &r1, &mut out);
+        ola.invalidate();
+        // 复位后不应再混入上一块（值域 1000+）的尾巴
+        let r2: Vec<f32> = (0..g.window).map(|i| i as f32 * 0.001).collect();
+        ola.emit(g, &r2, &mut out);
+        for i in 0..g.crossfade {
+            assert!(out[i] < 1.0, "复位后仍在混入过期尾巴: out[{i}] = {}", out[i]);
+        }
+    }
+
+    #[test]
+    fn ola_set_crossfade_is_idempotent_and_rebuilds_on_change() {
+        let mut ola = Ola::new(96);
+        let first = ola.fade_in.clone();
+        ola.set_crossfade(96);
+        assert_eq!(ola.fade_in, first, "长度没变就不该重算");
+        ola.valid = true;
+        ola.set_crossfade(192);
+        assert_eq!(ola.fade_in.len(), 192);
+        assert_eq!(ola.tail.len(), 192);
+        assert!(!ola.valid, "改了交叉淡化长度必须复位，否则会拿长度不匹配的尾巴去混合");
     }
 }
