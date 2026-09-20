@@ -1,23 +1,3 @@
-//! 模型层：定位插件目录与 CUDA 运行库、发现并加载模型、跑 HuBERT / RMVPE / RVC。
-//!
-//! ## 用户模型优先
-//! `discover()` 的搜索顺序（见函数文档）保证：**用户自己放进插件目录的 RVC 模型优先**，
-//! 找不到才回退到插件自带模型。设置里的 `model_file` 可以显式指定；不填就自动挑
-//! `user_models/` 下修改时间最新的 `.onnx`。
-//!
-//! ## 按模型声明自适应装配输入
-//! 用户模型来自各种导出脚本，命名与签名都不统一（`nsff0`/`pitchf`、`sid`/`ds`、
-//! 有没有 `rnd`、HuBERT 的 `source` 是秩 2 还是秩 3、mask 是 bool 还是 int64）。
-//! 所以这里读模型**声明的 dtype 与秩**来决定怎么建张量，只把符号维实例化，其余照抄声明。
-//! 详见「输入装配」一节。
-//!
-//! ## 性能
-//! 单块推理耗时 τ 必须小于 chunk_ms，否则会持续积压并触发断流。为此：
-//! - `GraphOptimizationLevel::All`（1.0 用的 Level1 少了 attention/layout 融合，对 transformer 慢数倍）；
-//! - RMVPE 的 mel 前端全部缓存：Hann 窗、128×513 滤波器组、FFT plan、所有中间缓冲只建一次；
-//!   magnitude 用 `[frame][freq]` 连续布局，mel 矩阵乘是顺序访存；
-//! - f0 后处理不再每帧分配 Vec；中值滤波用 `total_cmp`，遇到 NaN 不会 panic。
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,7 +10,6 @@ use rustfft::{num_complex::Complex, FftPlanner};
 
 use crate::logger;
 
-// ────────────────────────── 插件目录 / DLL 引导 ──────────────────────────
 #[cfg(target_os = "windows")]
 mod imp {
     use std::ffi::OsString;
@@ -51,11 +30,10 @@ mod imp {
     const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: DWORD = 0x0000_0004;
     const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: DWORD = 0x0000_0002;
 
-    /// 本 cdylib 自己所在的目录（不是宿主 exe 的目录）。
     pub fn current_module_dir() -> Option<PathBuf> {
         unsafe {
             let mut module: HMODULE = std::ptr::null_mut();
-            // 用本函数的地址反查所属模块，避免拿到宿主 exe 的路径
+
             let address = (current_module_dir as usize) as *const WCHAR;
             let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
             if GetModuleHandleExW(flags, address, &mut module) == 0 || module.is_null() {
@@ -70,13 +48,6 @@ mod imp {
         }
     }
 
-    /// 把 `dir` 加入进程 DLL 搜索路径。
-    ///
-    /// ⚠️ `SetDllDirectoryW` 是**进程级全局单槽**设置：会影响宿主和其他插件，
-    /// 多个插件同时调用会互相覆盖。这里之所以还要用它，是因为 onnxruntime 本体
-    /// 已经用 `ort::init_from(绝对路径)` 显式加载了，但它的 CUDA EP
-    /// (`onnxruntime_providers_cuda.dll`) 依赖的 cudart/cublas/cudnn 仍然要走
-    /// 标准搜索顺序，而这些 DLL 只存在于插件的 `libs/` 里。
     pub fn add_dll_directory(dir: &std::path::Path) -> bool {
         let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
         unsafe { SetDllDirectoryW(wide.as_ptr()) != 0 }
@@ -99,11 +70,6 @@ mod imp {
         fn dladdr(addr: *mut std::ffi::c_void, info: *mut DlInfo) -> i32;
     }
 
-    /// 本 cdylib 自己所在的目录。
-    ///
-    /// 必须用 `dladdr` 反查「本函数地址所属的共享对象」，不能用 `current_exe()`：
-    /// 后者返回的是**宿主进程**的可执行文件目录，插件会跑到宿主安装目录里去找
-    /// libs/ 和 models/，于是永远加载不到自己的模型（rvc-harness 就是这么发现的）。
     pub fn current_module_dir() -> Option<PathBuf> {
         unsafe {
             let mut info = DlInfo {
@@ -132,7 +98,6 @@ pub fn plugin_dir() -> Option<PathBuf> {
     imp::current_module_dir()
 }
 
-/// onnxruntime 动态库的绝对路径（存在则返回）。
 pub fn ort_dylib_path(plugin_dir: &std::path::Path) -> Option<PathBuf> {
     let libs = plugin_dir.join("libs");
     let name = if cfg!(target_os = "windows") {
@@ -146,15 +111,21 @@ pub fn ort_dylib_path(plugin_dir: &std::path::Path) -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-/// 在加载 ORT 之前调用一次：把 `libs/` 加入 DLL 搜索路径。
 pub fn prepare_runtime(plugin_dir: &std::path::Path) {
     let libs = plugin_dir.join("libs");
-    if libs.is_dir() {
-        imp::add_dll_directory(&libs);
+    if !libs.is_dir() {
+        return;
+    }
+
+    match ort::ep::cuda::preload_dylibs(Some(&libs), Some(&libs)) {
+        Ok(()) => logger::log("[ORT] CUDA/cuDNN 已按绝对路径预加载"),
+        Err(e) => {
+            logger::log(&format!("[ORT] CUDA/cuDNN 预加载未全部命中（{e}），改用 SetDllDirectoryW"));
+            imp::add_dll_directory(&libs);
+        }
     }
 }
 
-// ────────────────────────── 模型发现（用户模型优先） ──────────────────────────
 pub const USER_MODEL_DIR: &str = "user_models";
 pub const BUNDLED_RVC: &str = "models/uma-Matikane_Tannhauser.onnx";
 pub const BUNDLED_HUBERT: &str = "models/hubert_base.onnx";
@@ -165,47 +136,52 @@ pub struct ModelSet {
     pub rvc: PathBuf,
     pub hubert: PathBuf,
     pub rmvpe: PathBuf,
-    /// 给用户看的来源说明，例如 `user_models/my_voice.onnx (用户模型)`
+
     pub rvc_label: String,
     pub rvc_source: Source,
 }
 
+impl ModelSet {
+    pub fn describe(&self) -> String {
+        let name = |p: &Path| {
+            p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string())
+        };
+        format!("RVC={} | HuBERT={} | RMVPE={}", self.rvc_label, name(&self.hubert), name(&self.rmvpe))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// 配置项显式指定
-    Config,
-    /// user_models/ 自动发现
+
     UserDir,
-    /// 插件自带
+
     Bundled,
 }
 
 impl Source {
     pub fn label(&self) -> &'static str {
         match self {
-            Source::Config => "配置指定",
             Source::UserDir => "用户模型",
             Source::Bundled => "插件自带",
         }
     }
 }
 
-/// 确保 `user_models/` 存在，并放一个说明文件（失败不影响功能）。
 pub fn ensure_user_dir(plugin_dir: &Path) -> PathBuf {
     let dir = plugin_dir.join(USER_MODEL_DIR);
     if fs::create_dir_all(&dir).is_ok() {
-        let readme = dir.join("把你的模型放这里.txt");
+        let readme = dir.join("README.txt");
         if !readme.exists() {
             let _ = fs::write(
                 &readme,
-                "把你自己的 RVC 模型（.onnx）直接放进这个文件夹即可，插件会优先加载它。\r\n\
+                "把 RVC 模型（.onnx）放进这个文件夹，插件会优先加载它。\r\n\
                  \r\n\
                  规则：\r\n\
-                 1. 放多个模型时，使用「修改时间最新」的那个；\r\n\
-                 2. 也可以在插件设置里用 model_file 明确指定文件名（例如 user_models/我的音色.onnx）；\r\n\
-                 3. 文件名里含 hubert / contentvec 的会当成内容编码器，含 rmvpe 的会当成音高提取器；\r\n\
-                 4. 找不到用户模型时自动回退到插件自带的 models/uma-Matikane_Tannhauser.onnx；\r\n\
-                 5. 实际加载了哪个模型，看插件目录下的 rvc_plugin.log，或启用插件后弹出的系统通知。\r\n",
+                 1. 放多个时取修改时间最新的那个；\r\n\
+                 2. 文件名含 hubert / contentvec 的当作内容编码器，含 rmvpe / f0 的当作音高提取器；\r\n\
+                 3. 这里没有可用模型时回退到插件自带的 models/uma-Matikane_Tannhauser.onnx；\r\n\
+                 4. 增删模型后需要在 MicYou 设置里关闭再启用本插件；\r\n\
+                 5. 实际加载了哪个模型，看插件目录下的 rvc_plugin.log 或启用时的系统通知。\r\n"
             );
         }
     }
@@ -226,7 +202,7 @@ fn list_onnx(dir: &Path) -> Vec<PathBuf> {
                     .unwrap_or(false)
         })
         .collect();
-    // 修改时间最新的排前面；同时间按文件名，保证可复现
+
     files.sort_by(|a, b| mtime(b).cmp(&mtime(a)).then_with(|| a.file_name().cmp(&b.file_name())));
     files
 }
@@ -241,35 +217,6 @@ fn rel(plugin_dir: &Path, p: &Path) -> String {
     p.strip_prefix(plugin_dir)
         .map(|r| r.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| p.to_string_lossy().into_owned())
-}
-
-/// 解析用户填的 `model_file`：允许 `my.onnx`、`user_models/my.onnx`、`models/my.onnx`。
-fn resolve_user_spec(plugin_dir: &Path, spec: &str) -> Option<PathBuf> {
-    let clean = spec.trim().replace('\\', "/");
-    if clean.is_empty() {
-        return None;
-    }
-    if clean.starts_with('/') || clean.contains(":") || clean.contains("..") {
-        logger::log(&format!("[Model] model_file 被拒绝（必须是插件目录内的相对路径）: {clean}"));
-        return None;
-    }
-    let direct = plugin_dir.join(&clean);
-    if direct.is_file() {
-        return Some(direct);
-    }
-    // 只给了文件名时，按搜索目录顺序找一遍
-    for dir in [USER_MODEL_DIR, "models/user", "models", ""] {
-        let cand = if dir.is_empty() {
-            plugin_dir.join(&clean)
-        } else {
-            plugin_dir.join(dir).join(&clean)
-        };
-        if cand.is_file() {
-            return Some(cand);
-        }
-    }
-    logger::log(&format!("[Model] model_file 指定的文件不存在: {clean}"));
-    None
 }
 
 fn pick_by_keyword(files: &[PathBuf], keywords: &[&str]) -> Option<PathBuf> {
@@ -288,65 +235,23 @@ fn pick_by_keyword(files: &[PathBuf], keywords: &[&str]) -> Option<PathBuf> {
     None
 }
 
-/// 完整的模型发现流程。`user_model_file` 来自配置（可为空）。
-pub fn discover(plugin_dir: &Path, user_model_file: &str) -> ModelSet {
+pub fn discover(plugin_dir: &Path) -> ModelSet {
     let user_dir = ensure_user_dir(plugin_dir);
     let user_files = list_onnx(&user_dir);
-    let models_user_files = list_onnx(&plugin_dir.join("models/user"));
-    let models_files = list_onnx(&plugin_dir.join("models"));
 
-    // ---- RVC 主模型 ----
-    let (rvc, source) = if let Some(p) = resolve_user_spec(plugin_dir, user_model_file) {
-        (p, Source::Config)
-    } else if let Some(p) = user_files
-        .iter()
-        .find(|p| !is_feature_model(p))
-        .cloned()
-        .or_else(|| models_user_files.iter().find(|p| !is_feature_model(p)).cloned())
-    {
-        (p, Source::UserDir)
-    } else {
-        let bundled = plugin_dir.join(BUNDLED_RVC);
-        if bundled.is_file() {
-            (bundled, Source::Bundled)
-        } else {
-            // 兜底：models/ 下任何不是 hubert/rmvpe 的 onnx
-            let fallback = models_files.iter().find(|p| !is_feature_model(p)).cloned();
-            (fallback.unwrap_or(bundled), Source::Bundled)
-        }
+    let (rvc, source) = match user_files.iter().find(|p| !is_feature_model(p)).cloned() {
+        Some(p) => (p, Source::UserDir),
+        None => (plugin_dir.join(BUNDLED_RVC), Source::Bundled),
     };
-
-    // ---- HuBERT / ContentVec（也允许用户覆盖）----
     let hubert_kw = ["hubert", "contentvec", "content_vec"];
-    let hubert = pick_by_keyword(&user_files, &hubert_kw)
-        .or_else(|| pick_by_keyword(&models_files, &hubert_kw))
-        .unwrap_or_else(|| plugin_dir.join(BUNDLED_HUBERT));
-
-    // ---- RMVPE ----
+    let hubert = pick_by_keyword(&user_files, &hubert_kw).unwrap_or_else(|| plugin_dir.join(BUNDLED_HUBERT));
     let rmvpe_kw = ["rmvpe", "f0"];
-    let rmvpe = pick_by_keyword(&user_files, &rmvpe_kw)
-        .or_else(|| pick_by_keyword(&models_files, &rmvpe_kw))
-        .unwrap_or_else(|| plugin_dir.join(BUNDLED_RMVPE));
+    let rmvpe = pick_by_keyword(&user_files, &rmvpe_kw).unwrap_or_else(|| plugin_dir.join(BUNDLED_RMVPE));
 
     let rvc_label = format!("{} ({})", rel(plugin_dir, &rvc), source.label());
-    logger::log(&format!("[Model] RVC    = {rvc_label}"));
-    logger::log(&format!("[Model] HuBERT = {}", rel(plugin_dir, &hubert)));
-    logger::log(&format!("[Model] RMVPE  = {}", rel(plugin_dir, &rmvpe)));
-    if !user_files.is_empty() {
-        let names: Vec<String> = user_files.iter().map(|p| rel(plugin_dir, p)).collect();
-        logger::log(&format!("[Model] user_models/ 候选: {}", names.join(", ")));
-    }
-
-    ModelSet {
-        rvc,
-        hubert,
-        rmvpe,
-        rvc_label,
-        rvc_source: source,
-    }
+    ModelSet { rvc, hubert, rmvpe, rvc_label, rvc_source: source }
 }
 
-/// hubert / rmvpe 这类“特征模型”不能当 RVC 主模型用，自动发现时要跳过。
 fn is_feature_model(p: &Path) -> bool {
     let name = p
         .file_stem()
@@ -357,25 +262,20 @@ fn is_feature_model(p: &Path) -> bool {
         .any(|kw| name.contains(kw))
 }
 
-// ────────────────────────── ONNX 会话 ──────────────────────────
-pub const HOP_48K: usize = 480; // 48kHz / 100fps
-pub const FEAT_DIM: usize = 768; // HuBERT 隐藏维度
+pub const HOP_48K: usize = 480;
+pub const FEAT_DIM: usize = 768;
 
-// ─────────────────────────── 会话构建 ───────────────────────────
-
-/// 用 CUDA EP 建会话；CUDA 不可用时**直接报错**而不是静默回退 CPU
-/// （CPU 推理必然慢于实时，会立刻表现为复读/断流，必须让它响亮地失败）。
-pub fn load_session(path: &str, allow_cpu_fallback: bool) -> Result<Session> {
+pub fn load_session(path: &str, allow_cpu_fallback: bool, opt: u32) -> Result<Session> {
     let cuda = ort::ep::CUDA::default().with_device_id(0).build();
+
+    let level = match opt {
+        0 => GraphOptimizationLevel::Level1,
+        1 => GraphOptimizationLevel::Level2,
+        _ => GraphOptimizationLevel::All,
+    };
     let mut builder = Session::builder()
         .map_err(|e| anyhow::anyhow!("builder: {e}"))?
-        // 全部图优化（= ORT_ENABLE_ALL = 99，含 attention / layout 融合）。
-        // ⚠️ 不要用 Level3：ort rc.13 把 Level3 映射成 ORT_ENABLE_LAYOUT(=3)，
-        // 而 ONNX Runtime 的 SetSessionGraphOptimizationLevel 只接受 {0,1,2,99}，
-        // 传 3 会直接报 "graph_optimization_level is not valid" ⇒ 三个模型全部加载失败、
-        // 插件永久静音。这个错误编译期查不出来，是靠 rvc-harness 跑真实 CPU 推理才抓到的。
-        // 1.0 用的 Level1(=ORT_ENABLE_BASIC) 只做基础重写，对 transformer 结构会慢数倍。
-        .with_optimization_level(GraphOptimizationLevel::All)
+        .with_optimization_level(level)
         .map_err(|e| anyhow::anyhow!("optimization level: {e}"))?;
 
     if allow_cpu_fallback {
@@ -393,18 +293,6 @@ pub fn load_session(path: &str, allow_cpu_fallback: bool) -> Result<Session> {
         .map_err(|e| anyhow::anyhow!("load {path}: {e}"))
 }
 
-// ─────────────────────────── 输入装配（按模型声明自适应）───────────────────────────
-//
-// 用户自己的模型来自各种导出脚本，命名和签名都不统一。实测过的三种：
-//   插件自带 : phone f32[1,T,768] / phone_lengths i64[B] / pitch i64[1,T] / nsff0 f32[1,T] / sid i64[B]
-//   GuraTalkV2: phone f32[1,T,768] / phone_lengths i64[B] / pitch i64[1,T] / **pitchf** f32[1,T]
-//              / **ds** i64[B] / **rnd** f32[1,192,T]     <- 名字不同，还多一个必需的噪声输入
-//   HuBERT(MidFord327): **source f32[B,L]（秩 2，不是 [1,1,L]）** / **padding_mask bool[B,L]**
-//
-// 所以这里不再按名字硬编码形状与类型，而是**读模型声明的 dtype 与秩**，
-// 只把符号维（-1）实例化成 frames / 音频长度，其余一律照抄声明。
-
-/// 一个输入在推理里扮演的角色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Phone,
@@ -432,12 +320,6 @@ fn is_int_ty(ty: TensorElementType) -> bool {
     )
 }
 
-/// 按「名字 + 声明的 dtype」分类。
-///
-/// 顺序很重要：`phone_lengths` 同时含 phone 和 len；`pitchf` 同时含 pitch 和 f0。
-/// 光看名字会把 `pitchf` 判成 coarse pitch（int64），喂进去就是
-/// `Unexpected input data type. Actual: tensor(int64), expected: tensor(float)`，
-/// 所以 f0 这一类必须结合 dtype 判断。
 pub fn classify(name: &str, ty: TensorElementType) -> Role {
     let n = name.to_lowercase();
     let int = is_int_ty(ty);
@@ -472,7 +354,6 @@ pub fn classify(name: &str, ty: TensorElementType) -> Role {
     Role::Unknown
 }
 
-/// VITS/RVC 系常见的标量超参默认值（名字对得上就用，对不上填 0 并告警）。
 fn scalar_default(name: &str) -> f64 {
     let n = name.to_lowercase();
     if n.contains("noise_scale_w") {
@@ -488,13 +369,12 @@ fn scalar_default(name: &str) -> f64 {
     }
 }
 
-/// 一个已声明输入的装配说明书。
 #[derive(Debug, Clone)]
 pub struct InputSpec {
     pub name: String,
     pub role: Role,
     pub ty: TensorElementType,
-    /// 声明的形状，-1 表示符号维
+
     pub dims: Vec<i64>,
 }
 
@@ -511,7 +391,6 @@ impl InputSpec {
         }
     }
 
-    /// 把符号维实例化：具体维照抄声明，-1 按角色填 frames / 音频长度 / 1。
     pub fn shape(&self, frames: usize, audio_len: usize) -> Vec<i64> {
         let n = self.dims.len();
         let mut out = self.dims.clone();
@@ -538,7 +417,7 @@ impl InputSpec {
                         1
                     }
                 }
-                // Pitch / NsfF0 / Noise / Unknown：最后一维是时间轴
+
                 _ => {
                     if last {
                         frames as i64
@@ -549,19 +428,16 @@ impl InputSpec {
             };
         }
         if out.is_empty() {
-            out.push(1); // 标量输入
+            out.push(1);
         }
         out
     }
 
-    /// `padding_mask` 在 fairseq 语义里 True = 该位置是填充，整段都是真音频时必须全 False；
-    /// `attention_mask` 语义相反（1 = 有效）。搞反了 HuBERT 会输出垃圾。
     fn mask_is_padding(&self) -> bool {
         self.name.to_lowercase().contains("padding")
     }
 }
 
-/// 一个块的全部原料。
 pub struct BlockData<'a> {
     pub phone: &'a [f32],
     pub pitch: &'a [i64],
@@ -585,12 +461,10 @@ fn fit_f32(src: &[f32], n: usize, name: &str, warn: &mut Option<String>) -> Vec<
     v
 }
 
-/// 按 spec 的声明类型与形状生成张量。
 pub fn build_input(spec: &InputSpec, d: &BlockData, warn: &mut Option<String>) -> Result<DynValue> {
     let shape = spec.shape(d.frames, d.audio.len());
     let n: usize = shape.iter().map(|x| (*x).max(1) as usize).product();
 
-    // 该角色对应的 f32 原料
     let floats = |role: Role, warn: &mut Option<String>| -> Vec<f32> {
         match role {
             Role::Phone => fit_f32(d.phone, n, &spec.name, warn),
@@ -652,7 +526,6 @@ fn fit_i64(src: &[i64], n: usize, name: &str, warn: &mut Option<String>) -> Vec<
     v
 }
 
-/// 极简 xorshift，避免为了填 `rnd` 引入 rand 依赖（每块 ~10k 个 float，纳秒级）。
 pub struct NoiseGen {
     state: u32,
     buf: Vec<f32>,
@@ -662,7 +535,7 @@ impl NoiseGen {
     pub fn new() -> Self {
         Self { state: 0x9E37_79B9, buf: Vec::new() }
     }
-    /// 生成 `n` 个近似标准正态的样本（4 个均匀分布求和 - 2，够 RVC 的 flow 用）
+
     pub fn fill(&mut self, n: usize) -> &[f32] {
         self.buf.clear();
         self.buf.reserve(n);
@@ -680,7 +553,6 @@ impl NoiseGen {
     }
 }
 
-/// 打印解析结果，方便用户排查“我的模型为什么跑不起来”。
 pub fn log_plan(tag: &str, specs: &[InputSpec]) {
     for s in specs {
         logger::log(&format!(
@@ -699,17 +571,13 @@ pub fn log_plan(tag: &str, specs: &[InputSpec]) {
         ));
     }
 }
-// ─────────────────────────── HuBERT / ContentVec ───────────────────────────
 
 pub struct HubertExtractor {
     session: Session,
     specs: Vec<InputSpec>,
-    /// 归一化后的输入缓冲，复用避免每块分配
+
     buf: Vec<f32>,
-    /// 有些导出对 16k 输入长度很挑剔（fairseq 的 conv 栈每 320 样本出一帧，
-    /// mask 长度却按另一套取整算，差 1 就在 attention 的 Where 节点上广播失败）。
-    /// 实测 MidFord327/Hubert-Base-ONNX：L=8960 失败、L=9280 成功。
-    /// 这里记录「需要在末尾补多少个零」，第一次扫出来之后就固定用，不再每块重试。
+
     pad_extra: usize,
     swept: bool,
 }
@@ -725,12 +593,11 @@ impl HubertExtractor {
         Self { session, specs, buf: Vec::new(), pad_extra: 0, swept: false }
     }
 
-    /// 返回展平的内容特征，长度是 `FEAT_DIM` 的整数倍（帧数 = len / 768，约 50fps）。
     pub fn extract(&mut self, pcm16k: &[f32]) -> Result<Vec<f32>> {
         if pcm16k.is_empty() {
             bail!("empty input");
         }
-        // 峰值归一化到 0.9（增益上限 10 倍），与 RVC 参考实现一致
+
         self.buf.clear();
         self.buf.extend_from_slice(pcm16k);
         let peak = self.buf.iter().fold(0.0f32, |m, x| m.max(x.abs()));
@@ -745,7 +612,7 @@ impl HubertExtractor {
             bail!("模型没有声明任何输入");
         }
         let base_len = self.buf.len();
-        // 已经扫过就直接用记住的补零量；没扫过则最多按 320 递增试 6 次
+
         let tries: usize = if self.swept { 1 } else { 6 };
         let start = self.pad_extra;
         let mut last_err = String::new();
@@ -771,7 +638,6 @@ impl HubertExtractor {
         bail!("HuBERT 推理失败（已尝试补零 0..{}）: {last_err}", (tries - 1) * 320);
     }
 
-    /// 用 `self.buf` 当前的内容跑一次（形状/类型按模型声明装配）。
     fn run_once(&mut self) -> Result<Vec<f32>> {
         let audio_len = self.buf.len();
         let specs = self.specs.clone();
@@ -785,7 +651,7 @@ impl HubertExtractor {
                 sid: 0,
                 audio: &self.buf,
                 noise: &[],
-                // HuBERT 的 "length" 类输入指的是采样点数，不是 RVC 帧数
+
                 frames: audio_len,
             };
             for s in specs.iter() {
@@ -808,10 +674,9 @@ impl HubertExtractor {
         bail!("未能取出内容特征（没有长度是 {FEAT_DIM} 整数倍的 f32 输出）");
     }
 }
-// ─────────────────────────── RMVPE mel 前端（全缓存）───────────────────────────
 
 const N_FFT: usize = 1024;
-const MEL_HOP: usize = 160; // 16kHz
+const MEL_HOP: usize = 160;
 const N_MELS: usize = 128;
 const N_FREQS: usize = N_FFT / 2 + 1;
 const MEL_FMIN: f32 = 30.0;
@@ -821,15 +686,15 @@ const MEL_SR: f32 = 16000.0;
 
 struct MelFrontend {
     window: Vec<f32>,
-    /// `[N_MELS][N_FREQS]` 行主序
+
     mel_basis: Vec<f32>,
     fft: Arc<dyn rustfft::Fft<f32>>,
-    // 复用缓冲
+
     padded: Vec<f32>,
     spec: Vec<Complex<f32>>,
-    /// `[num_frames][N_FREQS]`
+
     mag: Vec<f32>,
-    /// `[num_frames][N_MELS]`
+
     mel_frames: Vec<f32>,
     cap_frames: usize,
 }
@@ -887,14 +752,12 @@ impl MelFrontend {
         }
     }
 
-    /// 返回 `(num_frames, total_frames)`，并把 log-mel 写进 `channel_major`
-    /// （形状 `[N_MELS][total_frames]`，正是 RMVPE 的输入布局）。
     fn compute(&mut self, pcm16k: &[f32], channel_major: &mut Vec<f32>) -> (usize, usize) {
         let pad = N_FFT / 2;
         let n = pcm16k.len();
         self.padded.clear();
         self.padded.reserve(n + 2 * pad);
-        // 反射填充（与 librosa reflect 一致，不含端点重复）
+
         for i in (1..=pad).rev() {
             self.padded.push(pcm16k[i.min(n.saturating_sub(1))]);
         }
@@ -910,7 +773,6 @@ impl MelFrontend {
         };
         self.ensure_cap(num_frames);
 
-        // STFT magnitude，写成 [frame][freq] 连续布局
         for f in 0..num_frames {
             let start = f * MEL_HOP;
             for i in 0..N_FFT {
@@ -923,7 +785,6 @@ impl MelFrontend {
             }
         }
 
-        // mel 矩阵乘 + log，先写成 [frame][mel]（顺序写），最后一次性转置成 [mel][frame]
         for f in 0..num_frames {
             let mag_row = &self.mag[f * N_FREQS..(f + 1) * N_FREQS];
             let out_row = &mut self.mel_frames[f * N_MELS..(f + 1) * N_MELS];
@@ -937,7 +798,6 @@ impl MelFrontend {
             }
         }
 
-        // 帧数补齐到 32 的倍数（RMVPE 的卷积下采样要求）
         let pad_time = 32 * ((num_frames.saturating_sub(1)) / 32 + 1) - num_frames;
         let total = num_frames + pad_time;
         channel_major.clear();
@@ -946,7 +806,7 @@ impl MelFrontend {
             for f in 0..num_frames {
                 channel_major.push(self.mel_frames[f * N_MELS + m]);
             }
-            // 反射填充尾部
+
             for i in 0..pad_time {
                 let idx = num_frames.saturating_sub(2 + i);
                 channel_major.push(self.mel_frames[idx * N_MELS + m]);
@@ -981,7 +841,6 @@ impl F0Extractor {
         }
     }
 
-    /// 提取 `frames` 个 100fps 的 f0（Hz，0 表示清音段）。返回的切片长度恒为 `frames`。
     pub fn extract(&mut self, pcm16k: &[f32], frames: usize) -> Result<&[f32]> {
         if frames == 0 {
             bail!("frames == 0");
@@ -1025,7 +884,7 @@ impl F0Extractor {
                 self.f0[f] = 0.0;
                 continue;
             }
-            // 抛物线插值（用 salience 加权重心，边界补零）
+
             let at = |i: usize| if i >= 4 && i < 364 { self.salience[i - 4] } else { 0.0 };
             let c = center + 4;
             let start = c.saturating_sub(4);
@@ -1041,9 +900,6 @@ impl F0Extractor {
             self.f0[f] = if (freq - 10.0).abs() < 1e-5 { 0.0 } else { freq };
         }
 
-        // 3 点中值滤波，抑制八度跳变。
-        // 注意必须读**原始**序列（和 RVC 参考实现一致），所以用两个滚动变量保存原值，
-        // 不能直接读 self.f0[i-1]——它在上一轮已经被覆写了。
         if usable >= 3 {
             let mut orig_prev = self.f0[0];
             let mut orig_cur = self.f0[1];
@@ -1061,19 +917,13 @@ impl F0Extractor {
 
 fn median3(a: f32, b: f32, c: f32) -> f32 {
     let mut arr = [a, b, c];
-    // total_cmp 对 NaN 也有全序，不会像 partial_cmp().unwrap() 那样 panic
+
     arr.sort_by(|x, y| x.total_cmp(y));
     arr[1]
 }
 
-/// 取第一个长度足够的 f32 输出。
-///
-/// 返回 owned `Vec` 而不是借用切片：`SessionOutputs::iter()` 产出的是临时借用，
-/// 借用检查器不允许把它带出函数（1.0 版同样是 `to_vec()` 才编过）。
-/// 拷贝量每块约 100KB（RVC 音频）/ 80KB（RMVPE hidden），10 块/秒 ≈ 1.8MB/s，
-/// 相对几十毫秒的推理耗时可以忽略。
 fn pick_f32_output(outputs: &SessionOutputs, min_len: usize) -> Option<Vec<f32>> {
-    // 优先按下标 0（RVC/RMVPE 的主输出），否则找第一个够长的 f32 张量
+
     if let Ok(v) = outputs[0].try_extract_tensor::<f32>() {
         if v.1.len() >= min_len {
             return Some(v.1.to_vec());
@@ -1089,23 +939,13 @@ fn pick_f32_output(outputs: &SessionOutputs, min_len: usize) -> Option<Vec<f32>>
     None
 }
 
-// ─────────────────────────── RVC 合成 ───────────────────────────
-
-/// 加载期探测的结果：这个模型能接受哪些帧数。
-///
-/// 很多社区导出的 RVC onnx **把序列长度写死了**（导出时没开 dynamic axes）。
-/// 实测 `GuraTalkV2.onnx` 只在 T=200 时能跑：它的注意力 Reshape 常量满足
-/// `2T²+199 == 2(T+1)(2T-1)`，而这个等式只有 T=200 成立；换任何别的帧数都会报
-/// `input_shape_size == requested_shape_size was false`。
-/// 这种情况下不能直接判死刑——把窗口撑到 T*480 就能用，而且延迟可以保持不变
-/// （多出来的长度全部塞进 left context，lookahead 与 chunk 不动）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelShape {
-    /// 帧数动态，任意 chunk 都能用
+
     Dynamic { hop: usize },
-    /// 导出时写死了序列长度，只能用 `frames` 帧
+
     Fixed { frames: usize, hop: usize },
-    /// 全部候选都失败（多半是签名不兼容），保留错误信息供上层告警
+
     Unknown { hop: usize },
 }
 
@@ -1116,7 +956,7 @@ pub struct RvcSynth {
     pitch: Vec<i64>,
     nsff0: Vec<f32>,
     noise: NoiseGen,
-    /// 模型是否需要 `rnd` 噪声输入（GuraTalkV2 这类导出需要，插件自带的模型不需要）
+
     noise_role: bool,
     logged: bool,
 }
@@ -1142,17 +982,12 @@ impl RvcSynth {
         }
     }
 
-    /// `phone_50fps` 是展平的 HuBERT 特征（约 50fps），内部插值到 `frames`（100fps）。
-    /// 返回模型输出的原始音频（采样率由调用方按长度推断）。
     pub fn synthesize(&mut self, frames: usize, sid: i64, f0: &[f32], phone_50fps: &[f32]) -> Result<Vec<f32>> {
         self.run(frames, sid, f0, phone_50fps, false)
     }
 
-    /// 加载期探测：先用当前配置的帧数试一次，再换一个帧数试，
-    /// 两次都过 = 动态模型；只有特定帧数能过 = 写死了长度，扫一遍常见值找出它。
-    /// 返回值同时带上实测的 hop（= 模型采样率 / 100）。
     pub fn probe(&mut self, want: usize) -> ModelShape {
-        // 常见「写死长度」的导出：2 秒 @100fps=200、以及 2 的幂附近
+
         const CANDIDATES: [usize; 12] = [200, 256, 128, 100, 64, 300, 400, 512, 150, 320, 96, 80];
         let first = want.clamp(8, 4096);
         match self.try_frames(first) {
@@ -1179,7 +1014,6 @@ impl RvcSynth {
         }
     }
 
-    /// 用全零特征试跑一次，成功则返回实测 hop（= 输出样本数 / 帧数）。
     fn try_frames(&mut self, frames: usize) -> Result<usize, String> {
         if frames < 2 {
             return Err("frames < 2".into());
@@ -1196,15 +1030,13 @@ impl RvcSynth {
     fn run(&mut self, frames: usize, sid: i64, f0: &[f32], phone_50fps: &[f32], quiet: bool) -> Result<Vec<f32>> {
         let frames_50 = phone_50fps.len() / FEAT_DIM;
         if frames_50 == 0 {
-            // v1.0 在这里会 panic（frames_50 == 0 ⇒ 索引越界），panic 被 catch_unwind 吃掉后
-            // worker 线程直接退出 ⇒ 插件从此永久静音。改成返回错误。
+
             bail!("HuBERT 特征为空");
         }
         if f0.len() < frames {
             bail!("f0 长度不足: {} < {frames}", f0.len());
         }
 
-        // 50fps -> 100fps 线性插值（复用缓冲，不每块分配）
         self.phone_100.clear();
         self.phone_100.resize(frames * FEAT_DIM, 0.0);
         let denom = if frames > 1 { (frames - 1) as f32 } else { 1.0 };
@@ -1233,7 +1065,7 @@ impl RvcSynth {
         let mut warn = None;
         let mut inputs: Vec<(String, DynValue)> = Vec::with_capacity(specs.len());
         {
-            // 需要 rnd 的模型每块重新生成噪声（RVC 的 flow 解码器靠它产生音色细节）
+
             let noise_slice: &[f32] = if self.noise_role {
                 let n = specs
                     .iter()
@@ -1275,7 +1107,6 @@ impl RvcSynth {
     }
 }
 
-/// RVC 的 coarse pitch：mel 刻度量化到 1..255，0 表示清音。
 pub fn f0_coarse(f: f32) -> i64 {
     if !(f > 0.0) {
         return 0;
@@ -1289,10 +1120,7 @@ pub fn f0_coarse(f: f32) -> i64 {
     }
     x.round().clamp(1.0_f32, 255.0_f32) as i64
 }
-// ─────────────────────────── 重采样（非 48k 模型兜底）───────────────────────────
 
-/// 模型输出采样率不是 48kHz 时（例如 40k 模型 hop=400、32k 模型 hop=320），
-/// 按实际长度比例线性重采样到目标长度。这是兜底路径：48k 模型 ratio≈1 时直接拷贝。
 pub fn resample_into(src: &[f32], dst: &mut Vec<f32>, dst_len: usize) {
     dst.clear();
     if dst_len == 0 || src.is_empty() {
@@ -1314,4 +1142,3 @@ pub fn resample_into(src: &[f32], dst: &mut Vec<f32>, dst_len: usize) {
         dst.push(src[i0] * (1.0 - frac) + src[i1] * frac);
     }
 }
-

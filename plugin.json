@@ -5,8 +5,12 @@
   "runtime": "native",
   "description": "曼波RVC变声器：本地实时流式 AI 变声，支持加载你自己的 RVC 模型",
   "license": "Unlicense",
-  "platforms": ["windows"],
-  "arches": ["x86_64"],
+  "platforms": [
+    "windows"
+  ],
+  "arches": [
+    "x86_64"
+  ],
   "updateUrl": "https://micyou-dev.github.io/MicYou-Plugins/plugin/opss.mambo-rvc-onnx/plugin.json",
   "apiVersion": 1,
   "entry": "mambo_rvc_onnx",
@@ -15,71 +19,91 @@
     "insertAfter": "VAD",
     "realtimeSafe": true
   },
-  "capabilities": ["dsp.node", "config.read"],
+  "capabilities": [
+    "dsp.node",
+    "config.read"
+  ],
   "configSchema": {
     "fields": [
-      {
-        "key": "model_file",
-        "fieldType": "string",
-        "label": "RVC 模型文件 / Model file",
-        "description": "留空 = 自动使用 user_models/ 里最新的 .onnx；也可以填相对路径，例如 user_models/我的音色.onnx。找不到就回退到插件自带模型。",
-        "default": ""
-      },
       {
         "key": "speaker_id",
         "fieldType": "number",
         "label": "音色编号 Speaker ID (sid)",
         "description": "多音色模型才需要改；单音色模型保持 0。",
-        "min": 0, "max": 32, "step": 1, "default": 0
+        "min": 0,
+        "max": 32,
+        "step": 1,
+        "default": 0
       },
       {
         "key": "f0_up_key",
         "fieldType": "number",
         "label": "变调 Pitch Shift (半音)",
         "description": "男变女推荐 +12，女变男推荐 -12，同声线微调 ±2。",
-        "min": -24, "max": 24, "step": 1, "default": 0
+        "min": -24,
+        "max": 24,
+        "step": 1,
+        "default": 0
       },
       {
         "key": "chunk_ms",
         "fieldType": "number",
         "label": "Chunk Size (ms) / 输出块大小",
-        "description": "延迟与稳定性的主旋钮。必须大于「单块推理耗时 τ」，否则会积压断流；τ 看插件目录的 rvc_plugin.log 或 GUI 插件日志。显卡弱就调大。",
-        "min": 20, "max": 500, "step": 10, "default": 100
+        "description": "每次推理输出的音频块。**必须大于单块推理耗时 τ**，否则积压到上限就会断流。τ 的估算见 README。",
+        "min": 50,
+        "max": 1000,
+        "step": 10,
+        "default": 200
       },
       {
         "key": "lookahead_ms",
         "fieldType": "number",
         "label": "Lookahead (ms) / 右上下文（决定延迟）",
-        "description": "块尾的预读量，直接影响音高与咬字在块边界的准确度。延迟 ≈ chunk + lookahead + jitter。",
-        "min": 0, "max": 500, "step": 10, "default": 150
+        "description": "块尾的预读量（右上下文）。延迟的主要来源之一。",
+        "min": 0,
+        "max": 600,
+        "step": 10,
+        "default": 80
       },
       {
         "key": "left_context_ms",
         "fieldType": "number",
         "label": "Left Context (ms) / 左上下文（只影响音质与算力）",
-        "description": "块前的历史量，不增加延迟，但会成比例增加每块的推理耗时。算力紧张就调小。",
-        "min": 0, "max": 2000, "step": 10, "default": 300
+        "description": "块前的历史量（左上下文）。**不增加延迟**，但成比例增加每块推理耗时。与 chunk、lookahead 之和就是推理音频长度，建议 >= 1000ms。",
+        "min": 0,
+        "max": 2000,
+        "step": 10,
+        "default": 720
       },
       {
         "key": "crossfade_ms",
         "fieldType": "number",
         "label": "Crossfade (ms) / 交叉淡化",
-        "description": "掩盖块拼接边界的毛刺。lookahead 或 left context 很小时适当调大；设 0 表示硬拼接。",
-        "min": 0, "max": 100, "step": 5, "default": 20
+        "description": "块拼接处的交叉淡化长度，用来掩盖边界毛刺。",
+        "min": 0,
+        "max": 100,
+        "step": 5,
+        "default": 50
       },
       {
         "key": "jitter_ms",
         "fieldType": "number",
         "label": "Jitter Buffer (ms) / 抖动缓冲",
-        "description": "输出缓冲垫，吸收推理耗时抖动，减少断流；代价是等量的固定延迟。",
-        "min": 0, "max": 300, "step": 10, "default": 40
+        "description": "输出缓冲垫，吸收推理耗时抖动。默认为 0；如果偶有断流且确认是推理性能逼近参数边界，可以适当加大（代价是等量的固定延迟）。",
+        "min": 0,
+        "max": 300,
+        "step": 10,
+        "default": 0
       },
       {
         "key": "max_latency_ms",
         "fieldType": "number",
         "label": "Max Backlog (ms) / 积压上限",
         "description": "推理跟不上实时（τ > chunk）时，积压超过这个值就丢弃最旧的音频把延迟拉回来，表现为一次短断流。宁可断流也不要无限延迟。",
-        "min": 50, "max": 3000, "step": 50, "default": 300
+        "min": 50,
+        "max": 3000,
+        "step": 50,
+        "default": 300
       },
       {
         "key": "gate_enabled",
@@ -92,22 +116,46 @@
         "key": "gate_db",
         "fieldType": "number",
         "label": "Gate Threshold (dBFS)",
-        "description": "低于这个电平判定为静音。环境噪声大就调高（例如 -55），气声被吃掉就调低（例如 -85）。",
-        "min": -100, "max": -20, "step": 1, "default": -70
+        "description": "低于这个电平判定为静音、跳过推理。气声被吃掉就调低，环境噪声被放大就调高。",
+        "min": -100,
+        "max": -20,
+        "step": 1,
+        "default": -80
+      },
+      {
+        "key": "ort_opt_level",
+        "fieldType": "select",
+        "label": "ONNX Runtime 图优化等级",
+        "description": "All 最快（默认）；若怀疑图优化改变了 vocoder 的数值导致音色异常，可切到 Basic（= v1.0 用的 Level1）对比。改动后会重建会话，有 1~3 秒静音。",
+        "default": "all",
+        "options": [
+          {
+            "value": "all",
+            "label": "All（最快，默认）"
+          },
+          {
+            "value": "extended",
+            "label": "Extended"
+          },
+          {
+            "value": "basic",
+            "label": "Basic（= v1.0 的 Level1，最保守）"
+          }
+        ]
       }
     ]
   },
   "config": {
-    "model_file": "",
     "speaker_id": 0,
     "f0_up_key": 0,
-    "chunk_ms": 100,
-    "lookahead_ms": 150,
-    "left_context_ms": 300,
-    "crossfade_ms": 20,
-    "jitter_ms": 40,
+    "chunk_ms": 200,
+    "lookahead_ms": 80,
+    "left_context_ms": 720,
+    "crossfade_ms": 50,
+    "jitter_ms": 0,
     "max_latency_ms": 300,
     "gate_enabled": true,
-    "gate_db": -70
+    "gate_db": -80,
+    "ort_opt_level": "all"
   }
 }
