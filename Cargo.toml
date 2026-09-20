@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 anyhow = "1"
 # load-dynamic: 运行期从插件目录 libs/ 加载 onnxruntime.dll，不在编译期下载二进制
 # default-features = false: 关掉 download-binaries（它会拉 ureq/openssl，纯浪费编译时间）
-ort = { version = "2.0.0-rc.13", default-features = false, features = ["load-dynamic", "cuda", "preload-dylibs"] }
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["load-dynamic", "cuda"] }
 rustfft = "6"
 crossbeam-channel = "0.5"
 

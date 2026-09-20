@@ -113,16 +113,8 @@ pub fn ort_dylib_path(plugin_dir: &std::path::Path) -> Option<PathBuf> {
 
 pub fn prepare_runtime(plugin_dir: &std::path::Path) {
     let libs = plugin_dir.join("libs");
-    if !libs.is_dir() {
-        return;
-    }
-
-    match ort::ep::cuda::preload_dylibs(Some(&libs), Some(&libs)) {
-        Ok(()) => logger::log("[ORT] CUDA/cuDNN 已按绝对路径预加载"),
-        Err(e) => {
-            logger::log(&format!("[ORT] CUDA/cuDNN 预加载未全部命中（{e}），改用 SetDllDirectoryW"));
-            imp::add_dll_directory(&libs);
-        }
+    if libs.is_dir() && imp::add_dll_directory(&libs) {
+        logger::log(&format!("[ORT] DLL 搜索路径 = {}", libs.display()));
     }
 }
 

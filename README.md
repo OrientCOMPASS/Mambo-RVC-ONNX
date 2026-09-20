@@ -27,9 +27,11 @@
 
 📂 `%APPDATA%\micyou\plugins\opss.mambo-rvc-onnx\libs\`
 
-预期 **22 个文件，全部是 `.dll`**。插件启动时会按绝对路径预加载其中的 CUDA/cuDNN 库
-（`cudart64_12`、`cublasLt64_12`、`cublas64_12`、`cufft64_11`、`cudnn*64_9`）；
-如果这 12 个文件名有缺失，会自动退回 `SetDllDirectoryW` 兜底，并在日志里写明走了哪条路径。
+预期 **22 个文件，全部是 `.dll`**。
+
+`onnxruntime.dll` 由插件按绝对路径显式加载；它依赖的 `onnxruntime_providers_cuda.dll`
+以及 `cudart64_12` / `cublas(Lt)64_12` / `cudnn*64_9` 等，靠插件启动时把 `libs/`
+加入进程的 DLL 搜索路径（`SetDllDirectoryW`）来解析。
 
 缺库时 ONNX Runtime 会用 CPU 推理。**CPU 推理是可用的**，只是每块耗时 τ 会显著变大，
 需要按下面的方法把 Chunk Size 调大来匹配——不是"不能用"，而是"要换一组参数"。
@@ -202,10 +204,10 @@ src/rvc.rs      模型层：目录与 CUDA 运行库引导、模型发现、ORT 
 - **实时安全**：`process()` 内无堆分配、无锁、无 Host API 调用；推理线程是自建子线程，
   按宿主规范同样不调用任何 Host API，需要给用户看的消息通过定时器回调在宿主线程转发
 - **不要**在 `Cargo.toml` 里设 `panic = "abort"`：本 cdylib 跑在宿主进程内，abort 会带走整个 MicYou
-- **调用顺序有硬约束**：`ort::ep::cuda::preload_dylibs` 必须在 `ort::init_from` **之后**调用。
-  `ort::Error` 的构造内部会走 `ortsys!`，dylib 尚未加载时 ort 会用默认库名（`onnxruntime.dll` /
-  `libonnxruntime.so`）懒加载，加载不到就 `expect` panic —— 而这个 panic 发生在 worker 线程里，
-  插件会直接变成永久静音。`init_ort_once` 里已经按正确顺序排好，改动时别调换
+- **任何 ort API 都必须在 `ort::init_from` 成功之后调用**：`ort::Error` 的构造内部会走 `ortsys!`，
+  dylib 尚未加载时 ort 会用默认库名（`onnxruntime.dll` / `libonnxruntime.so`）懒加载，加载不到就
+  `expect` panic —— 而它发生在 worker 线程里，插件会变成永久静音。所以 `init_ort_once` 返回
+  `Result`：找不到 dylib 时走正常的错误 + 15 秒重试路径，不会 panic
 - **ORT 图优化等级不要用 `Level3`**：ort rc.13 把它映射到 `ORT_ENABLE_LAYOUT`(=3)，
   而 ORT 只接受 `{0,1,2,99}`，运行期会报 `graph_optimization_level is not valid` 导致三个模型全部
   加载失败。全部优化对应的枚举是 `All`(=99)。这类错误 `cargo check` 查不出来
