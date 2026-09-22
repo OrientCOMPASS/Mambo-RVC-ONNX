@@ -2,26 +2,43 @@
   "id": "opss.mambo-rvc-onnx",
   "name": "Mambo RVC ONNX",
   "version": "1.1.0",
-  "runtime": "native",
-  "description": "曼波RVC变声器：本地实时流式 AI 变声，支持加载你自己的 RVC 模型",
+  "description": "Mambo RVC voice changer: local real-time streaming AI voice conversion (check README to download CUDA dlls), with support for loading your own RVC models.",
+  "descriptionI18n": {
+    "zh": "曼波RVC变声器：本地实时流式 AI 变声，支持加载你自己的 RVC 模型。阅读README下载CUDA运行库。",
+    "zh-CN": "曼波RVC变声器：本地实时流式 AI 变声，支持加载你自己的 RVC 模型。阅读README下载CUDA运行库。"
+  },
+  "nameI18n": {
+    "zh": "曼波RVC变声器",
+    "zh-CN": "曼波RVC变声器"
+  },
   "license": "Unlicense",
+  "runtime": "native",
+  "entry": "mambo_rvc_onnx",
   "platforms": [
     "windows"
   ],
   "arches": [
     "x86_64"
   ],
-  "updateUrl": "https://micyou-dev.github.io/MicYou-Plugins/plugin/opss.mambo-rvc-onnx/plugin.json",
   "apiVersion": 1,
-  "entry": "mambo_rvc_onnx",
+  "capabilities": [
+    "dsp.node",
+    "config.read"
+  ],
   "kind": "dsp",
   "dsp": {
     "insertAfter": "VAD",
     "realtimeSafe": true
   },
-  "capabilities": [
-    "dsp.node",
-    "config.read"
+  "keywords": [
+    "rvc",
+    "voice-changer",
+    "onnx",
+    "onnxruntime",
+    "realtime",
+    "dsp",
+    "cuda",
+    "ai-voice"
   ],
   "configSchema": {
     "fields": [
@@ -157,5 +174,10 @@
     "gate_enabled": true,
     "gate_db": -80,
     "ort_opt_level": "all"
-  }
+  },
+  "repository": "https://github.com/OrientCOMPASS/Mambo-RVC-ONNX",
+  "homepage": "https://github.com/OrientCOMPASS/Mambo-RVC-ONNX",
+  "updateUrl": "https://github.com/OrientCOMPASS/Mambo-RVC-ONNX/releases/latest/download/plugin.json",
+  "downloadUrl": "https://github.com/OrientCOMPASS/Mambo-RVC-ONNX/releases/latest/download/opss.mambo-rvc-onnx.zip",
+  "readmeUrl": "https://raw.githubusercontent.com/OrientCOMPASS/Mambo-RVC-ONNX/refs/heads/main/README.md"
 }
