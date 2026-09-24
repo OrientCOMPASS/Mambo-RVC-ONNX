@@ -172,7 +172,7 @@ pub fn ensure_user_dir(plugin_dir: &Path) -> PathBuf {
                  1. 放多个时取修改时间最新的那个；\r\n\
                  2. 文件名含 hubert / contentvec 的当作内容编码器，含 rmvpe / f0 的当作音高提取器；\r\n\
                  3. 这里没有可用模型时回退到插件自带的 models/uma-Matikane_Tannhauser.onnx；\r\n\
-                 4. 增删模型后需要在 MicYou 设置里关闭再启用本插件；\r\n\
+                 4. 增删模型后，在 设置 → 曼波RVC 控制台面板 点「重载模型」（或关闭再启用本插件）；\r\n\
                  5. 实际加载了哪个模型，看插件目录下的 rvc_plugin.log 或启用时的系统通知。\r\n"
             );
         }
@@ -257,9 +257,7 @@ fn is_feature_model(p: &Path) -> bool {
 pub const HOP_48K: usize = 480;
 pub const FEAT_DIM: usize = 768;
 
-pub fn load_session(path: &str, allow_cpu_fallback: bool, opt: u32) -> Result<Session> {
-    let cuda = ort::ep::CUDA::default().with_device_id(0).build();
-
+pub fn load_session(path: &str, cuda: bool, opt: u32) -> Result<Session> {
     let level = match opt {
         0 => GraphOptimizationLevel::Level1,
         1 => GraphOptimizationLevel::Level2,
@@ -270,13 +268,13 @@ pub fn load_session(path: &str, allow_cpu_fallback: bool, opt: u32) -> Result<Se
         .with_optimization_level(level)
         .map_err(|e| anyhow::anyhow!("optimization level: {e}"))?;
 
-    if allow_cpu_fallback {
+    if cuda {
+        // 仅在 libs/ 的 CUDA 运行库齐备时才会走到这里（stream.rs 门控）。
+        // error_on_failure：加载不上就报错，由调用方回退纯 CPU 重建，
+        // 避免"软注册"后无法分辨会话实际跑在哪个 EP 上。
+        let ep = ort::ep::CUDA::default().with_device_id(0).build();
         builder = builder
-            .with_execution_providers([cuda])
-            .map_err(|e| anyhow::anyhow!("EP register: {e}"))?;
-    } else {
-        builder = builder
-            .with_execution_providers([cuda.error_on_failure()])
+            .with_execution_providers([ep.error_on_failure()])
             .map_err(|e| anyhow::anyhow!("EP register: {e}"))?;
     }
 

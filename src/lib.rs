@@ -10,6 +10,7 @@ use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{bounded, Sender};
 
+mod fetch;
 mod rvc;
 mod stream;
 
@@ -314,6 +315,11 @@ pub(crate) mod config {
         MODEL_EPOCH.load(Ordering::Relaxed)
     }
 
+    /// 强制 worker 重建推理会话（运行库拉取完成后切 CUDA、面板手动重载等场景）。
+    pub fn bump_model_epoch() {
+        MODEL_EPOCH.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn parse_num(text: &str) -> Option<i32> {
         text.parse::<i32>().ok().or_else(|| text.parse::<f64>().ok().map(|v| v.round() as i32))
     }
@@ -451,6 +457,246 @@ unsafe fn host_notify(title: &str, body: &str) {
             f(h.ctx, t.as_ptr(), b.as_ptr());
         }
     });
+}
+
+unsafe fn host_set_config(key: &str, json_value: &str) {
+    with_host(|h| {
+        if let (Some(f), Ok(k), Ok(v)) = (h.set_config, CString::new(key), CString::new(json_value)) {
+            f(h.ctx, k.as_ptr(), v.as_ptr());
+        }
+    });
+}
+
+// ───────────────────── CUDA 运行库拉取（面板桥接层） ─────────────────────
+//
+// 分工：fetch.rs 的下载线程只做网络/磁盘 IO 与进度状态更新（绝不碰 Host API）；
+// 这里在宿主分发的线程（handle_message / interval:tick 回调）里读快照、写配置、
+// 发通知——符合宿主「Host API 只能在宿主线程调用」的硬性规范。
+
+const RT_TICK_MS: u64 = 500;
+const RT_MIRROR_KEY: &str = "rt_mirror";
+
+struct FetchSlot {
+    handle: fetch::Handle,
+    interval_id: u64,
+    last_json: String,
+}
+
+static FETCH: Mutex<Option<FetchSlot>> = Mutex::new(None);
+
+fn phase_str(p: stream::Phase) -> &'static str {
+    match p {
+        stream::Phase::Loading => "loading",
+        stream::Phase::Ready => "ready",
+        stream::Phase::Error => "error",
+    }
+}
+
+/// 运行库盘点 + 推理引擎快照，写入配置键 `rt_status`（面板打开时读取）。
+fn publish_rt_status() {
+    let plugin_dir = rvc::plugin_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let inv = fetch::runtime_inventory(&plugin_dir.join("libs"));
+    let engine = {
+        let ptr = STATE.load(Ordering::Acquire);
+        if ptr.is_null() {
+            serde_json::json!({ "phase": "off", "model": "", "detail": "", "cuda": false, "blocks": 0, "flushes": 0 })
+        } else {
+            let state = unsafe { &*ptr };
+            match state.status.lock() {
+                Ok(s) => serde_json::json!({
+                    "phase": phase_str(s.phase),
+                    "model": s.model_label,
+                    "detail": s.detail,
+                    "cuda": s.cuda,
+                    "blocks": s.blocks,
+                    "flushes": s.flushes,
+                }),
+                Err(_) => serde_json::json!({ "phase": "off", "model": "", "detail": "", "cuda": false, "blocks": 0, "flushes": 0 }),
+            }
+        }
+    };
+    let mirror = unsafe {
+        with_host(|h| read_config(h, RT_MIRROR_KEY))
+            .flatten()
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .unwrap_or_else(|| "tuna".to_string())
+    };
+    let v = serde_json::json!({
+        "v": 1,
+        "ts": fetch::now_ms(),
+        "plugin_version": env!("CARGO_PKG_VERSION"),
+        "mirror": mirror,
+        "ort": { "core": inv.ort[0], "cuda_provider": inv.ort[1], "shared": inv.ort[2], "ready": inv.ort_ready() },
+        "cuda": {
+            "present": inv.present,
+            "total": inv.total,
+            "missing": inv.missing,
+            "missing_bytes": inv.missing_bytes,
+        },
+        // 包清单直接下发，面板不硬编码（与 pin 表单一数据源）
+        "pkgs": fetch::PKGS.iter().map(|p| serde_json::json!({
+            "name": p.pkg,
+            "version": p.version,
+            "bytes": p.wheel_size,
+            "have": fetch::pkg_have_count(&plugin_dir.join("libs"), p),
+            "files": p.dlls.iter().map(|d| d.name).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "engine": engine,
+    });
+    unsafe { host_set_config("rt_status", &v.to_string()) };
+}
+
+fn publish_rt_state(p: &fetch::Progress) {
+    if let Ok(j) = serde_json::to_string(p) {
+        unsafe { host_set_config("rt_state", &j) };
+    }
+}
+
+/// 面板 `ui:rt_fetch` → 启动下载线程 + 专属进度定时器。宿主线程调用。
+fn start_fetch(mirror_pref: &str) {
+    let mut slot_g = FETCH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut old) = slot_g.take() {
+        if !old.handle.is_finished() {
+            // 已有任务在跑：不重复启动，只把当前进度再发布一次
+            logger::log("[Fetch] 已有任务在进行中，忽略重复触发");
+            publish_rt_state(&old.handle.snapshot());
+            *slot_g = Some(old);
+            return;
+        }
+        // 旧任务已结束但收尾 tick 还没跑到：代为清理定时器、收尾并 join 线程句柄，
+        // 避免 interval 泄漏 / JoinHandle 被 drop 后线程游离 / done 的 CUDA 切换被吞掉
+        let snap = old.handle.snapshot();
+        if old.interval_id != 0 {
+            let id = old.interval_id;
+            with_host(|h| {
+                if let Some(clear) = h.clear_interval {
+                    unsafe { clear(h.ctx, id) };
+                }
+            });
+            if snap.terminal() {
+                collect_terminal(&snap);
+            }
+        }
+        old.handle.join();
+    }
+    let Some(plugin_dir) = rvc::plugin_dir() else {
+        logger::log("[Fetch] 无法定位插件目录，任务未启动");
+        return;
+    };
+    let mirror = fetch::mirror_by_id(mirror_pref);
+    match fetch::spawn(plugin_dir.clone(), mirror.id) {
+        Ok(handle) => {
+            publish_rt_state(&handle.snapshot());
+            let mut interval_id: u64 = 0;
+            with_host(|h| {
+                if let (Some(set_interval), Ok(payload)) = (h.set_interval, CString::new("rt_progress")) {
+                    let mut id: u64 = 0;
+                    unsafe {
+                        if set_interval(h.ctx, RT_TICK_MS, payload.as_ptr(), &mut id) == mpl_result_t::MPL_OK {
+                            interval_id = id;
+                        }
+                    }
+                }
+            });
+            if interval_id == 0 {
+                // 老宿主没有定时器 API：退化为跟随 1 秒状态 tick 刷新（见 interval:tick 分支）
+                logger::log("[Fetch] set_interval 不可用，进度将按 1 秒粒度刷新");
+            }
+            logger::log(&format!("[Fetch] 任务启动 mirror={}（{}）", mirror.id, mirror.label));
+            *slot_g = Some(FetchSlot { handle, interval_id, last_json: String::new() });
+        }
+        Err(e) => {
+            logger::log(&format!("[Fetch] 启动失败: {e}"));
+            let v = serde_json::json!({ "v": 1, "state": "error", "error": e, "step": "", "ts": fetch::now_ms() });
+            unsafe { host_set_config("rt_state", &v.to_string()) };
+        }
+    }
+}
+
+fn cancel_fetch() {
+    let g = FETCH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = g.as_ref() {
+        if !s.handle.is_finished() {
+            logger::log("[Fetch] 收到取消请求");
+            s.handle.cancel();
+        }
+    }
+}
+
+/// 任务终态收尾（宿主线程）：刷新盘点、通知用户；done 时热切换到 CUDA。
+fn collect_terminal(p: &fetch::Progress) {
+    publish_rt_status();
+    match p.state.as_str() {
+        "done" => {
+            // libs/ 可能是任务运行中新建的，重新挂 DLL 搜索路径；
+            // 再触发会话重建，让 CUDA EP 生效（ORT 不缓存加载失败，可热切换）。
+            if let Some(dir) = rvc::plugin_dir() {
+                rvc::prepare_runtime(&dir);
+            }
+            config::bump_model_epoch();
+            logger::log("[Fetch] 运行库就绪，已触发模型重建（尝试切换 CUDA）");
+            unsafe {
+                host_notify(
+                    "CUDA 运行库已就绪",
+                    "正在重建推理会话以切换到 GPU（约 1~3 秒静音）。\n若稍后日志仍显示 CPU，请在设置里关闭再启用本插件。",
+                )
+            };
+        }
+        "error" => {
+            logger::log(&format!("[Fetch] 失败: {}", p.error));
+            unsafe { host_notify("运行库拉取失败", &p.error.chars().take(160).collect::<String>()) };
+        }
+        _ => {}
+    }
+}
+
+/// 定时器回调（宿主线程）：把下载线程的进度快照同步到配置，终态时收尾。
+fn tick_fetch() {
+    let mut slot_g = FETCH.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(slot) = slot_g.as_mut() else { return };
+    let p = slot.handle.snapshot();
+    let json = match serde_json::to_string(&p) {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    if json != slot.last_json {
+        slot.last_json = json.clone();
+        unsafe { host_set_config("rt_state", &json) };
+    }
+    if !p.terminal() {
+        return;
+    }
+    // ── 终态收尾 ──
+    if slot.interval_id != 0 {
+        let id = slot.interval_id;
+        slot.interval_id = 0;
+        with_host(|h| {
+            if let Some(clear) = h.clear_interval {
+                unsafe { clear(h.ctx, id) };
+            }
+        });
+    }
+    collect_terminal(&p);
+}
+
+/// deinit：取消任务并等待线程退出（库卸载前必须 join，否则线程还在执行插件代码）。
+fn shutdown_fetch() {
+    let mut taken = None;
+    if let Ok(mut g) = FETCH.lock() {
+        taken = g.take();
+    }
+    if let Some(mut s) = taken {
+        s.handle.cancel();
+        if s.interval_id != 0 {
+            let id = s.interval_id;
+            with_host(|h| {
+                if let Some(clear) = h.clear_interval {
+                    unsafe { clear(h.ctx, id) };
+                }
+            });
+        }
+        s.handle.join();
+    }
 }
 
 fn reload_config() -> bool {
@@ -591,9 +837,29 @@ pub unsafe extern "C" fn micyou_plugin_init(host: *const mpl_host_api_t) -> mpl_
         });
         let prev = STATE.swap(Box::into_raw(state), Ordering::AcqRel);
         if !prev.is_null() {
-
             drop(unsafe { Box::from_raw(prev) });
         }
+
+        // ── 面板初始数据 ──
+        // rt_status: 运行库盘点 + 引擎快照；rt_state: 上次任务的终态或 idle
+        // （覆盖旧值，避免面板读到上次进程遗留的“下载中”假象）
+        publish_rt_status();
+        let mirror = unsafe {
+            with_host(|h| read_config(h, RT_MIRROR_KEY))
+                .flatten()
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .unwrap_or_default()
+        };
+        publish_rt_state(&fetch::initial_progress(&plugin_dir.join("libs"), &mirror));
+        // 设置侧边栏面板图标
+        with_host(|h| {
+            if let (Some(f), Ok(panel), Ok(icon)) =
+                (h.set_panel_icon, CString::new("console"), CString::new("🎤"))
+            {
+                unsafe { f(h.ctx, panel.as_ptr(), icon.as_ptr()) };
+            }
+        });
+
         mpl_result_t::MPL_OK
     })
 }
@@ -612,11 +878,13 @@ pub unsafe extern "C" fn micyou_plugin_deinit() {
         if id != 0 {
             with_host(|h| {
                 if let Some(clear) = h.clear_interval {
-
                     unsafe { clear(h.ctx, id) };
                 }
             });
         }
+
+        // 先收掉拉取任务：取消 + join（库卸载前线程必须退出）
+        shutdown_fetch();
 
         state.is_running.store(false, Ordering::Relaxed);
 
@@ -756,16 +1024,45 @@ pub extern "C" fn micyou_plugin_handle_message(
                     log_effective_params();
                 }
             }
-            "interval:tick" => {
-
+            // ── 面板桥动作（usePluginPanelBridge 的 trigger → ui:<action>）──
+            "ui:rt_status" => publish_rt_status(),
+            "ui:rt_fetch" => {
                 let body = unsafe { payload_string(payload, len) };
-                if body.contains("status") {
+                let mirror = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("mirror").and_then(|m| m.as_str()).map(String::from))
+                    .unwrap_or_default();
+                start_fetch(&mirror);
+            }
+            "ui:rt_cancel" => cancel_fetch(),
+            "ui:reload" => {
+                // 面板「重载模型」：增删 user_models/ 后无需禁用再启用插件
+                config::bump_model_epoch();
+                logger::log("[Panel] 触发模型重载");
+                publish_rt_status();
+            }
+            "ui:log" => {
+                // 面板 console.* 会被宿主转发到这里，便于用户反馈时带上面板侧日志
+                let body = unsafe { payload_string(payload, len) };
+                let msg = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
+                    .unwrap_or(body);
+                logger::log(&format!("[Panel] {}", msg.chars().take(300).collect::<String>()));
+            }
+            "interval:tick" => {
+                let body = unsafe { payload_string(payload, len) };
+                if body.contains("rt_progress") {
+                    // 拉取任务专属 500ms 定时器
+                    tick_fetch();
+                } else if body.contains("status") {
                     report_status();
+                    // 兜底：老宿主没有第二个定时器时，进度跟随 1s 状态 tick 刷新
+                    tick_fetch();
                     let ptr = STATE.load(Ordering::Acquire);
                     let do_poll = if ptr.is_null() {
                         false
                     } else {
-
                         let reported = unsafe { &mut *(*ptr).reported.get() };
                         reported.ticks = reported.ticks.wrapping_add(1);
                         reported.ticks % CONFIG_POLL_TICKS == 0

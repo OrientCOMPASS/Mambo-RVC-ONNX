@@ -1,11 +1,11 @@
 {
   "id": "opss.mambo-rvc-onnx",
   "name": "Mambo RVC ONNX",
-  "version": "1.1.0",
-  "description": "Mambo RVC voice changer: local real-time streaming AI voice conversion (check README to download CUDA dlls), with support for loading your own RVC models.",
+  "version": "1.2.0",
+  "description": "Mambo RVC voice changer: local real-time streaming AI voice conversion with one-click CUDA runtime fetch (PyPI mirrors) in the settings panel, and support for loading your own RVC models.",
   "descriptionI18n": {
-    "zh": "曼波RVC变声器：本地实时流式 AI 变声，支持加载你自己的 RVC 模型。阅读README下载CUDA运行库。",
-    "zh-CN": "曼波RVC变声器：本地实时流式 AI 变声，支持加载你自己的 RVC 模型。阅读README下载CUDA运行库。"
+    "zh": "曼波RVC变声器：本地实时流式 AI 变声，设置面板一键拉取 CUDA 运行库（国内镜像+断点续传），支持加载你自己的 RVC 模型。",
+    "zh-CN": "曼波RVC变声器：本地实时流式 AI 变声，设置面板一键拉取 CUDA 运行库（国内镜像+断点续传），支持加载你自己的 RVC 模型。"
   },
   "nameI18n": {
     "zh": "曼波RVC变声器",
@@ -23,7 +23,8 @@
   "apiVersion": 1,
   "capabilities": [
     "dsp.node",
-    "config.read"
+    "config.read",
+    "config.write"
   ],
   "kind": "dsp",
   "dsp": {
@@ -66,9 +67,9 @@
         "key": "chunk_ms",
         "fieldType": "number",
         "label": "Chunk Size (ms) / 输出块大小",
-        "description": "每次推理输出的音频块。**必须大于单块推理耗时 τ**，否则积压到上限就会断流。τ 的估算见 README。",
-        "min": 50,
-        "max": 1000,
+        "description": "每次推理输出的音频块。**必须大于单块推理耗时 τ**，否则积压到上限就会断流。GPU 常见 100~200，CPU 需按 README 估算加大。",
+        "min": 20,
+        "max": 500,
         "step": 10,
         "default": 200
       },
@@ -78,7 +79,7 @@
         "label": "Lookahead (ms) / 右上下文（决定延迟）",
         "description": "块尾的预读量（右上下文）。延迟的主要来源之一。",
         "min": 0,
-        "max": 600,
+        "max": 500,
         "step": 10,
         "default": 80
       },
@@ -179,5 +180,16 @@
   "homepage": "https://github.com/OrientCOMPASS/Mambo-RVC-ONNX",
   "updateUrl": "https://github.com/OrientCOMPASS/Mambo-RVC-ONNX/releases/latest/download/plugin.json",
   "downloadUrl": "https://github.com/OrientCOMPASS/Mambo-RVC-ONNX/releases/latest/download/opss.mambo-rvc-onnx.zip",
-  "readmeUrl": "https://raw.githubusercontent.com/OrientCOMPASS/Mambo-RVC-ONNX/refs/heads/main/README.md"
+  "readmeUrl": "https://raw.githubusercontent.com/OrientCOMPASS/Mambo-RVC-ONNX/refs/heads/main/README.md",
+  "ui": {
+    "route": "panel",
+    "label": "Mambo RVC",
+    "panels": [
+      {
+        "id": "console",
+        "label": "控制台",
+        "entry": "panel.html"
+      }
+    ]
+  }
 }

@@ -11,7 +11,8 @@
 - **推理音频长度**（= 左上下文 + 输出块 + 右预读）越长，模型看到的上下文越充分，音质越好，但每块的计算量也越大；
 - **输出块（Chunk）** 越短，延迟越低，但每秒的推理次数越多。
 
-所有参数都在 MicYou 的插件设置里，用来匹配你自己的硬件和延迟目标。
+所有参数都在 **设置 → 曼波RVC 控制台面板**（或插件卡片的表单）里，
+用来匹配你自己的硬件和延迟目标；面板会实时显示推理音频长度与估算延迟。
 
 ---
 
@@ -21,25 +22,51 @@
 
 用 MicYou 安装 Release 里的插件包。
 
-### 2. 放入 CUDA 运行库
-
-插件目录下的 `libs/` 需要包含 ONNX Runtime 与 CUDA/cuDNN 运行库（Release 页面的 `cuda_dll.zip`）：
-
-📂 `%APPDATA%\micyou\plugins\opss.mambo-rvc-onnx\libs\`
-
-预期 **22 个文件，全部是 `.dll`**。
-
-`onnxruntime.dll` 由插件按绝对路径显式加载；它依赖的 `onnxruntime_providers_cuda.dll`
-以及 `cudart64_12` / `cublas(Lt)64_12` / `cudnn*64_9` 等，靠插件启动时把 `libs/`
-加入进程的 DLL 搜索路径（`SetDllDirectoryW`）来解析。
-
-缺库时 ONNX Runtime 会用 CPU 推理。**CPU 推理是可用的**，只是每块耗时 τ 会显著变大，
-需要按下面的方法把 Chunk Size 调大来匹配——不是"不能用"，而是"要换一组参数"。
-
-### 3. 启用
+### 2. 启用插件
 
 重启 MicYou，在设置里启用 `opss.mambo-rvc-onnx`。启用后会弹一条系统通知，
 告诉你**实际加载了哪个模型**；同样的信息也写在插件目录的 `rvc_plugin.log` 里。
+
+插件包自带的 `libs/` 里已经有 3 个 ONNX Runtime 文件
+（`onnxruntime.dll` / `onnxruntime_providers_cuda.dll` / `onnxruntime_providers_shared.dll`），
+启用后即可用 **CPU 推理**先跑起来——CPU 是可用的，只是每块耗时 τ 会显著变大，
+需要按下面的方法把 Chunk Size 调大来匹配，不是"不能用"，而是"要换一组参数"。
+
+### 3. 一键拉取 CUDA 运行库（推荐）
+
+要用 GPU，需要 19 个 CUDA/cuDNN 运行库（约 **2.1GB 下载 / 3.2GB 磁盘**）。
+它们**不在插件包里**，而是在面板中按需拉取：
+
+1. 打开 **设置 → 侧边栏「曼波RVC · 控制台」**（插件专属面板）；
+2. 缺库时顶部会有黄色提醒，「CUDA 运行库」卡片自动展开；
+3. 选择下载源（**清华 TUNA**（默认）/ 阿里云 / 中科大 / 腾讯云 / PyPI 官方），点 **开始拉取**；
+4. 面板实时显示每个包的下载 / 校验 / 解压进度、速度与剩余时间；
+5. 全部完成后插件**自动重建推理会话切换到 CUDA**（约 1~3 秒静音），无需重启。
+
+拉取的文件来自 **NVIDIA 官方发布在 PyPI 的 wheel**，版本固定并逐个做 **SHA256 校验**；
+下载到插件目录 `.rt_cache/`（每包解压完立即删除，磁盘峰值约 4GB），
+最终解压到 📂 `%APPDATA%\micyou\plugins\opss.mambo-rvc-onnx\libs\`。
+支持**断点续传**（取消 / 断网后点开始拉取即可继续），单个镜像失败会**自动轮换**下一个。
+
+> 手动方式也支持：自行把 19 个 dll 放进 `libs/` 即可（清单见「预期文件」）。
+> `onnxruntime.dll` 由插件按绝对路径显式加载；其余依赖靠插件启动时把 `libs/`
+> 加入进程 DLL 搜索路径（`SetDllDirectoryW`）解析。
+
+<details>
+<summary><b>预期文件（libs/ 共 22 个 dll）</b></summary>
+
+| 来源 | 文件 |
+| :--- | :--- |
+| 插件自带（ORT 1.27.1 cuda12） | `onnxruntime.dll` `onnxruntime_providers_cuda.dll` `onnxruntime_providers_shared.dll` |
+| `nvidia-cuda-runtime-cu12==12.9.79` | `cudart64_12.dll` |
+| `nvidia-cublas-cu12==12.9.2.10` | `cublas64_12.dll` `cublasLt64_12.dll` |
+| `nvidia-cudnn-cu12==9.25.1.1` | `cudnn64_9.dll` `cudnn_adv64_9.dll` `cudnn_cnn64_9.dll` `cudnn_engines_precompiled64_9.dll` `cudnn_engines_runtime_compiled64_9.dll` `cudnn_engines_tensor_ir64_9.dll` `cudnn_ext64_9.dll` `cudnn_graph64_9.dll` `cudnn_heuristic64_9.dll` `cudnn_ops64_9.dll` |
+| `nvidia-cufft-cu12==11.4.1.4` | `cufft64_11.dll` `cufftw64_11.dll` |
+| `nvidia-curand-cu12==10.3.10.19` | `curand64_10.dll` |
+| `nvidia-cusolver-cu12==11.7.5.82` | `cusolver64_11.dll` `cusolverMg64_11.dll` |
+| `nvidia-cusparse-cu12==12.5.10.65` | `cusparse64_12.dll` |
+
+</details>
 
 > **DSP 链位置**：宿主目前把插件节点固定插在 **AEC 之后**（manifest 里的 `insertAfter` 暂未被使用），
 > 也就是说变声结果还会再经过宿主的降噪 / EQ / AGC / VAD。宿主的降噪是针对真人语音训练的，
@@ -60,7 +87,7 @@
 
 - 文件名含 `hubert` / `contentvec` 的会被当成内容编码器，含 `rmvpe` / `f0` 的会被当成音高提取器。
   所以你可以只覆盖其中一个，其余继续用自带的。
-- **增删模型后，需要在 MicYou 设置里关闭再启用本插件**（模型是在插件启用时加载的）。
+- **增删模型后，在 设置 → 曼波RVC 控制台面板 点「重载模型」**（或关闭再启用本插件）。
 - 多音色模型用 **Speaker ID** 选音色；单音色模型保持 0。
 
 ### 兼容性：签名不一致的模型也能用
@@ -163,7 +190,8 @@ GPU 上 τ 通常只有几十毫秒，Chunk Size 可以取到 100~200ms。
 | 电音，参数已经够大 | 可能是宿主的降噪/AGC 在处理合成音色，或 ORT 的激进图优化 | 把 `Plugins` 节点拖到处理链末尾；把 ORT 图优化等级切到 `basic` 对比 |
 | 软起音/气声被切掉 | 静音门限太高 | 调低 Gate Threshold（如 −90），或关掉 Silence Gate |
 | 对方偶尔听到**你的原声** | 极端情况下单次音频块超过 1 秒触发旁路 | 正常网络下不会发生；若频繁出现请反馈 |
-| 完全没声音，日志有 `加载失败` | CUDA/ORT 库缺失或模型文件缺失 | 检查 `libs/` 的 22 个 dll 和 `models/`；插件会每 15 秒重试，补齐文件后无需重启 |
+| 完全没声音，日志有 `加载失败` | ORT 库缺失或模型文件缺失 | 检查 `libs/` 的 3 个 onnxruntime dll 和 `models/`；插件会每 15 秒重试，补齐文件后无需重启 |
+| 能用但延迟大、CPU 占用高 | CUDA 运行库未拉取，正在 CPU 推理 | 打开面板「CUDA 运行库」卡片一键拉取，完成后自动切到 GPU |
 
 ---
 
@@ -186,23 +214,44 @@ GPU 上 τ 通常只有几十毫秒，Chunk Size 可以取到 100~200ms。
 ## 🛠️ 开发者说明
 
 ```
-src/lib.rs      宿主接口层：C ABI、生命周期、实时 process、参数、文件日志、状态上报
+src/lib.rs      宿主接口层：C ABI、生命周期、实时 process、参数、文件日志、状态上报、
+                       面板桥接（ui:rt_status / ui:rt_fetch / ui:rt_cancel / ui:reload）
 src/stream.rs   流式缓冲层：无锁 SPSC 环形缓冲 + 窗口调度器（OLA / 积压控制 / 热重载编排）
 src/rvc.rs      模型层：目录与 CUDA 运行库引导、模型发现、ORT 会话、
                        输入自适应装配、HuBERT / RMVPE(mel 前端) / RVC、重采样
+src/fetch.rs    运行库拉取：PyPI pin 表、多镜像断点续传下载、SHA256 校验、
+                       wheel(zip) 流式解压、进度状态机（面板轮询 get_config 展示）
+panel.html      设置面板（自包含单文件）：参数滑杆 + 可折叠的「CUDA 运行库」拉取卡片
+tools/gen_pins.py  重新生成 fetch.rs 的 pin 表（PyPI JSON + Range 读 wheel 中央目录，不下载整包）
 ```
 
 - **构建**：`cargo build --release` → `target/release/mambo_rvc_onnx.dll`
   （`entry` 写的是无后缀基础名，宿主按平台自动补 `.dll`/`.so`/`.dylib`；
   Linux/macOS 产物需去掉 `lib` 前缀才能跨平台共用一个 ZIP）
-- **测试**：`cargo test` —— 14 个单元测试，覆盖环形缓冲的 SPSC 正确性、
-  窗口调度的「每块只输出一次且严格按时间顺序」、OLA 状态机的不变量、以及默认窗口的对齐约束
+- **测试**：`cargo test` —— 23 个单元测试，覆盖环形缓冲的 SPSC 正确性、
+  窗口调度的「每块只输出一次且严格按时间顺序」、OLA 状态机的不变量、默认窗口的对齐约束、
+  pin 表一致性（7 包 / 19 dll / sha256 格式 / 升序）、zip 中央目录解析与解压往返、sha256 向量。
+  另有 2 个 `#[ignore]` 的真实网络集成测试（从清华镜像下载最小 wheel、断点续传拼接后校验 sha256）：
+  `cargo test --release -- --ignored`
 - **端到端验证**：`../rvc-harness`（独立程序，不属于插件本体）通过真实 C ABI 加载编译产物、
   跑真实 ONNX Runtime 推理，把输出解码回时间轴来判定有没有复读/倒流/丢块/卡死
-- **CI**：`.github/workflows/main.yml`，每次 push 自动构建 dll、校验 ABI 导出符号、打包插件 zip，
-  推 `v*` 标签时发布 Release
-- **实时安全**：`process()` 内无堆分配、无锁、无 Host API 调用；推理线程是自建子线程，
-  按宿主规范同样不调用任何 Host API，需要给用户看的消息通过定时器回调在宿主线程转发
+- **CI**：`.github/workflows/main.yml` 每次 push 构建 dll + 跑单测；
+  `.github/workflows/release.yml` 在推 `v*` 标签时校验三处版本号一致、构建、检查 ABI 导出符号、
+  下载 ORT 官方 cuda12 包取 3 个 dll、复用 v1.1.0 Release 的模型（可用 `models_url` 输入覆盖），
+  打包 `opss.mambo-rvc-onnx.zip` + `plugin.json`（updateUrl 资产）发布 Release
+- **实时安全**：`process()` 内无堆分配、无锁、无 Host API 调用；推理线程与下载线程都是自建子线程，
+  按宿主规范同样不调用任何 Host API，需要给用户看的消息通过定时器回调在宿主线程转发。
+  拉取进度 = 下载线程写 `Arc<Mutex<Progress>>`，宿主线程的 500ms 定时器读快照写 `set_config("rt_state")`，
+  面板 iframe 每 500ms 轮询 `get_config`（面板桥只有 get/set_config + trigger，没有事件订阅）
+- **运行库版本 pin 在 `src/fetch.rs` 的 `PKGS` 表**：与 ORT 的 cuda12 构建匹配（CUDA 12.9 + cuDNN 9.25）。
+  ONNX Runtime 官方从 1.27 起 PyPI wheel 只发 CUDA 13 版，**cuda12 构建只存在于 GitHub Release 资产**
+  （`onnxruntime-win-x64-gpu_cuda12-<ver>.zip`），CI 里同样 pin 了 1.27.1。
+  升级组合时：改 release.yml 的 `ORT_ZIP_URL` + 跑 `python3 tools/gen_pins.py --latest` 重新生成 pin 表，
+  两者的大版本必须匹配（ORT cuda12 ↔ `nvidia-*-cu12`）
+- **CUDA EP 门控**：`libs/` 里 19 个运行库**全部就位（大小精确匹配）才会尝试注册 CUDA EP**，
+  缺库直接建 CPU 会话，不做无谓的 provider 加载尝试；拉取完成后 `MODEL_EPOCH` +1 触发会话重建，
+  ORT 的 provider 加载失败不缓存（`ProviderLibrary::Get()` 失败即 Unload），因此**不用重启就能热切到 CUDA**
+- **`init_ort_once` 只缓存成功**：失败（如 `onnxruntime.dll` 暂时缺失）允许 15 秒重试路径继续尝试
 - **不要**在 `Cargo.toml` 里设 `panic = "abort"`：本 cdylib 跑在宿主进程内，abort 会带走整个 MicYou
 - **任何 ort API 都必须在 `ort::init_from` 成功之后调用**：`ort::Error` 的构造内部会走 `ortsys!`，
   dylib 尚未加载时 ort 会用默认库名（`onnxruntime.dll` / `libonnxruntime.so`）懒加载，加载不到就

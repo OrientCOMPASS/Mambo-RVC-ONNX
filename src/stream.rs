@@ -143,6 +143,9 @@ pub struct Status {
     pub blocks: u64,
     pub flushes: u32,
 
+    /// 三个会话是否都真实跑在 CUDA EP 上（面板展示 / rt_status 用）
+    pub cuda: bool,
+
     pub revision: u64,
 }
 
@@ -161,6 +164,7 @@ impl Default for Status {
             detail: String::new(),
             blocks: 0,
             flushes: 0,
+            cuda: false,
             revision: 0,
         }
     }
@@ -230,8 +234,23 @@ impl Engine {
             anyhow::anyhow!(e)
         })?;
 
+        // CUDA 门控：libs/ 里 19 个运行库齐备才尝试 CUDA EP。
+        // 缺库时不做无谓的 provider 加载尝试，日志与面板给出明确指引（面板可一键拉取）。
+        let inv = crate::fetch::runtime_inventory(&plugin_dir.join("libs"));
+        let cuda_ready = inv.cuda_ready();
+        if !cuda_ready {
+            logger::log(&format!(
+                "[Model] CUDA 运行库未就绪（{}/{}，缺 {} 个文件），本次使用 CPU 推理；\n\
+                 \x20      可在 设置 → 曼波RVC 面板「CUDA 运行库」卡片一键拉取（国内镜像），完成后自动切回 GPU",
+                inv.present, inv.total, inv.missing.len()
+            ));
+        }
+
         let mut detail = String::new();
-        let mut cuda_ok = true;
+        let mut cuda_ok = cuda_ready;
+        if !cuda_ready {
+            detail = format!("CPU 推理（CUDA 运行库缺 {} 个，可在面板拉取）", inv.missing.len());
+        }
         let load = |path: &PathBuf,
                     tag: &str,
                     detail: &mut String,
@@ -239,16 +258,16 @@ impl Engine {
          -> anyhow::Result<ort::session::Session> {
             let p = path.to_string_lossy();
             if *cuda_ok {
-                match rvc::load_session(&p, false, opt) {
+                match rvc::load_session(&p, true, opt) {
                     Ok(s) => return Ok(s),
                     Err(e) => {
                         *cuda_ok = false;
-                        logger::log(&format!("[Model] CUDA EP 不可用（{e}），改用 CPU；请检查 libs/ 里的 CUDA 运行库"));
+                        logger::log(&format!("[Model] CUDA EP 不可用（{e}），改用 CPU；请检查显卡驱动与 libs/ 运行库"));
                         *detail = "CUDA 不可用，已回退 CPU".to_string();
                     }
                 }
             }
-            rvc::load_session(&p, true, opt)
+            rvc::load_session(&p, false, opt)
                 .map_err(|e2| anyhow::anyhow!("{tag} 加载失败 {}: {e2}", path.display()))
         };
 
@@ -283,8 +302,10 @@ impl Engine {
             s.detail = detail.clone();
             s.blocks = 0;
             s.flushes = 0;
+            s.cuda = cuda_ok;
         });
-        logger::log(&format!("[Model] 全部就绪，RVC = {}{}", set.rvc_label,
+        logger::log(&format!("[Model] 全部就绪，RVC = {} | EP = {}{}", set.rvc_label,
+            if cuda_ok { "CUDA" } else { "CPU" },
             if detail.is_empty() { String::new() } else { format!(" | {detail}") }));
         if set.rvc_source == rvc::Source::Bundled {
             logger::log("[Model] user_models/ 下没有可用模型，使用插件自带模型");
@@ -294,9 +315,18 @@ impl Engine {
 }
 
 fn init_ort_once(plugin_dir: &PathBuf) -> Result<(), String> {
-    use std::sync::OnceLock;
-    static RES: OnceLock<Result<(), String>> = OnceLock::new();
-    RES.get_or_init(|| {
+    // 只缓存成功结果：失败（如 libs/ 里还没有 onnxruntime.dll）必须允许 15 秒后重试，
+    // 否则用户补齐文件 / 面板拉取运行库后，本次进程内永远无法恢复。
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static LOCK: Mutex<()> = Mutex::new(());
+    if DONE.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if DONE.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let res = (|| {
         let Some(path) = rvc::ort_dylib_path(plugin_dir) else {
             return Err(format!(
                 "未找到 onnxruntime 动态库（期望在 {}）",
@@ -309,8 +339,11 @@ fn init_ort_once(plugin_dir: &PathBuf) -> Result<(), String> {
         logger::log(&format!("[ORT] {}", path.display()));
         rvc::prepare_runtime(plugin_dir);
         Ok(())
-    })
-    .clone()
+    })();
+    if res.is_ok() {
+        DONE.store(true, Ordering::Release);
+    }
+    res
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

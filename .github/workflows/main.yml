@@ -19,6 +19,9 @@ jobs:
       - name: 缓存 Cargo 依赖 (加快后续构建速度)
         uses: Swatinem/rust-cache@v2
 
+      - name: 单元测试 (23 个用例：环形缓冲/窗口调度/OLA/运行库 pin 表/zip 解析/sha256)
+        run: cargo test --release
+
       - name: 执行 Release 构建
         # 根据项目要求，使用 --release 构建，产物会输出在 target/release/ 目录下
         run: cargo build --release

@@ -1,0 +1,1015 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mambo RVC</title>
+<style>
+/* ── 主题：优先用宿主注入的 Material 3 HSL 变量（宿主把 :root 变量表前置注入），
+      这里只定义带兜底值的别名变量，独立预览时也有完整观感 ─────────────── */
+:root {
+  --c-primary: hsl(var(--primary, 262 83% 58%));
+  --c-on-primary: hsl(var(--on-primary, 0 0% 100%));
+  --c-primary-container: hsl(var(--primary-container, 262 90% 92%));
+  --c-on-primary-container: hsl(var(--on-primary-container, 262 60% 25%));
+  --c-surface: hsl(var(--surface, 0 0% 99%));
+  --c-surface-bright: hsl(var(--surface-bright, 0 0% 100%));
+  --c-surface-container: hsl(var(--surface-container, 0 0% 96%));
+  --c-surface-variant: hsl(var(--surface-variant, 260 20% 94%));
+  --c-on-surface: hsl(var(--on-surface, 240 10% 12%));
+  --c-on-surface-variant: hsl(var(--on-surface-variant, 250 8% 42%));
+  --c-outline: hsl(var(--outline, 250 8% 82%));
+  --c-outline-variant: hsl(var(--outline-variant, 250 10% 90%));
+  --c-error: hsl(var(--error, 4 80% 48%));
+  --c-error-container: hsl(var(--error-container, 4 90% 94%));
+  --c-on-error-container: hsl(var(--on-error-container, 4 60% 30%));
+  --c-tertiary: hsl(var(--tertiary, 150 60% 40%));
+  --c-tertiary-container: hsl(var(--tertiary-container, 150 60% 92%));
+  --c-on-tertiary-container: hsl(var(--on-tertiary-container, 150 50% 20%));
+  --c-warn-container: hsl(40 92% 92%);
+  --c-on-warn-container: hsl(32 60% 32%);
+  --c-warn-dot: hsl(38 92% 46%);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { color-scheme: light dark; }
+body {
+  font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--c-surface);
+  color: var(--c-on-surface);
+  font-size: 14px;
+  line-height: 1.5;
+  padding: 18px 18px 30px;
+}
+.wrap { max-width: 760px; margin: 0 auto; }
+
+/* ── 页头 ─────────────────────────────────────────────── */
+.head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+.head .logo { font-size: 26px; line-height: 1; }
+.head h1 { font-size: 19px; font-weight: 700; color: var(--c-primary); letter-spacing: .2px; }
+.head .ver {
+  font-size: 11px; color: var(--c-on-surface-variant);
+  border: 1px solid var(--c-outline-variant); border-radius: 999px; padding: 1px 8px;
+}
+.spacer { flex: 1; }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 600; border-radius: 999px; padding: 4px 12px;
+  background: var(--c-surface-container); color: var(--c-on-surface-variant);
+  border: 1px solid var(--c-outline-variant);
+}
+.pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--c-outline); flex: none; }
+.pill.ok  { background: var(--c-tertiary-container); color: var(--c-on-tertiary-container); border-color: transparent; }
+.pill.ok .dot { background: var(--c-tertiary); }
+.pill.warn { background: var(--c-warn-container); color: var(--c-on-warn-container); border-color: transparent; }
+.pill.warn .dot { background: var(--c-warn-dot); animation: blink 1.2s infinite; }
+.pill.err { background: var(--c-error-container); color: var(--c-on-error-container); border-color: transparent; }
+.pill.err .dot { background: var(--c-error); }
+.pill.load .dot { background: var(--c-primary); animation: blink .9s infinite; }
+@keyframes blink { 50% { opacity: .25; } }
+
+/* ── 卡片与折叠 ───────────────────────────────────────── */
+.card {
+  background: var(--c-surface-bright);
+  border: 1px solid var(--c-outline-variant);
+  border-radius: 16px;
+  margin-bottom: 12px;
+  overflow: hidden;
+}
+.card-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 16px; cursor: pointer; user-select: none;
+}
+.card-head:hover { background: color-mix(in srgb, var(--c-surface-container) 55%, transparent); }
+.card-head h2 { font-size: 15px; font-weight: 700; }
+.card-head .sub { font-size: 12px; color: var(--c-on-surface-variant); margin-top: 1px; }
+.chev { transition: transform .22s ease; color: var(--c-on-surface-variant); flex: none; font-size: 12px; }
+.card.closed .chev { transform: rotate(-90deg); }
+.card-body-wrap { display: grid; grid-template-rows: 1fr; transition: grid-template-rows .24s ease; }
+.card.closed .card-body-wrap { grid-template-rows: 0fr; }
+.card-body-wrap > .inner { overflow: hidden; min-height: 0; }
+.card-body { padding: 2px 16px 16px; }
+.card.plain .card-head { cursor: default; }
+.card.plain .card-head:hover { background: none; }
+
+/* ── 提醒横幅 ─────────────────────────────────────────── */
+.alert {
+  display: none; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: var(--c-warn-container); color: var(--c-on-warn-container);
+  border: 1px solid transparent; border-radius: 14px;
+  padding: 12px 14px; margin-bottom: 12px; font-size: 13px;
+}
+.alert.show { display: flex; }
+.alert.crit { background: var(--c-error-container); color: var(--c-on-error-container); }
+.alert b { font-weight: 700; }
+
+/* ── 状态行 ───────────────────────────────────────────── */
+.rows { display: flex; flex-direction: column; gap: 7px; }
+.row { display: flex; align-items: baseline; gap: 8px; font-size: 13px; }
+.row .k { color: var(--c-on-surface-variant); flex: none; min-width: 84px; }
+.row .v { color: var(--c-on-surface); word-break: break-all; font-variant-numeric: tabular-nums; }
+.row .v.mono { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12px; }
+.chip {
+  display: inline-block; font-size: 11px; font-weight: 700; border-radius: 999px;
+  padding: 1px 9px; vertical-align: 1px;
+}
+.chip.gpu { background: var(--c-tertiary-container); color: var(--c-on-tertiary-container); }
+.chip.cpu { background: var(--c-warn-container); color: var(--c-on-warn-container); }
+
+/* ── 参数区 ───────────────────────────────────────────── */
+.group + .group { margin-top: 16px; }
+.group-title {
+  font-size: 12px; font-weight: 700; letter-spacing: .8px; text-transform: uppercase;
+  color: var(--c-primary); margin-bottom: 10px;
+  display: flex; align-items: center; gap: 8px;
+}
+.group-title::after { content: ""; flex: 1; height: 1px; background: var(--c-outline-variant); }
+.ctl { margin-bottom: 13px; }
+.ctl-top { display: flex; align-items: baseline; gap: 8px; margin-bottom: 3px; }
+.ctl-top label { font-size: 13px; font-weight: 600; }
+.ctl-top .val {
+  margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 700; font-size: 13px;
+  background: var(--c-primary-container); color: var(--c-on-primary-container);
+  border-radius: 8px; padding: 0 8px; min-width: 52px; text-align: center;
+}
+.ctl .hint { font-size: 11.5px; color: var(--c-on-surface-variant); margin-top: 2px; }
+input[type=range] {
+  -webkit-appearance: none; appearance: none; width: 100%; height: 22px;
+  background: transparent; cursor: pointer; display: block;
+}
+input[type=range]::-webkit-slider-runnable-track {
+  height: 6px; border-radius: 3px;
+  background: linear-gradient(to right, var(--c-primary) 0 var(--fill, 50%), var(--c-surface-variant) var(--fill, 50%) 100%);
+}
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 18px; height: 18px; border-radius: 50%; margin-top: -6px;
+  background: var(--c-primary); border: 3px solid var(--c-surface-bright);
+  box-shadow: 0 1px 4px rgba(0,0,0,.3);
+  transition: transform .1s ease;
+}
+input[type=range]:active::-webkit-slider-thumb { transform: scale(1.18); }
+input[type=range]::-moz-range-track { height: 6px; border-radius: 3px; background: var(--c-surface-variant); }
+input[type=range]::-moz-range-progress { height: 6px; border-radius: 3px; background: var(--c-primary); }
+input[type=range]::-moz-range-thumb {
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--c-primary); border: 3px solid var(--c-surface-bright);
+  box-shadow: 0 1px 4px rgba(0,0,0,.3);
+}
+input[type=range]:disabled { opacity: .4; cursor: not-allowed; }
+
+.readout {
+  display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  background: var(--c-surface-container); border-radius: 12px; padding: 9px 12px;
+  font-size: 12.5px; color: var(--c-on-surface-variant); margin: 2px 0 14px;
+}
+.readout b { color: var(--c-on-surface); font-variant-numeric: tabular-nums; }
+.readout .tag-ok { color: var(--c-tertiary); font-weight: 700; }
+.readout .tag-warn { color: var(--c-warn-dot); font-weight: 700; }
+
+/* 开关 */
+.switch-row { display: flex; align-items: center; gap: 10px; margin-bottom: 13px; }
+.switch {
+  position: relative; width: 44px; height: 24px; flex: none;
+  background: var(--c-surface-variant); border-radius: 999px; cursor: pointer;
+  transition: background .15s ease; border: 1px solid var(--c-outline-variant);
+}
+.switch::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
+  border-radius: 50%; background: var(--c-on-surface-variant);
+  transition: transform .15s ease, background .15s ease;
+}
+.switch.on { background: var(--c-primary); border-color: transparent; }
+.switch.on::after { transform: translateX(20px); background: var(--c-on-primary); }
+
+/* 下拉与预设 */
+select.sel {
+  appearance: none; -webkit-appearance: none;
+  background: var(--c-surface-container); color: var(--c-on-surface);
+  border: 1px solid var(--c-outline-variant); border-radius: 10px;
+  padding: 7px 30px 7px 12px; font-size: 13px; cursor: pointer; width: 100%;
+  background-image: linear-gradient(45deg, transparent 50%, var(--c-on-surface-variant) 50%),
+                    linear-gradient(135deg, var(--c-on-surface-variant) 50%, transparent 50%);
+  background-position: calc(100% - 16px) 55%, calc(100% - 11px) 55%;
+  background-size: 5px 5px, 5px 5px; background-repeat: no-repeat;
+}
+.presets { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.presets button, .btn.ghost {
+  border: 1px solid var(--c-outline-variant); background: var(--c-surface-container);
+  color: var(--c-on-surface-variant); border-radius: 999px; padding: 4px 12px;
+  font-size: 12px; font-weight: 600; cursor: pointer; transition: all .12s ease;
+}
+.presets button:hover, .btn.ghost:hover { background: var(--c-surface-variant); color: var(--c-on-surface); }
+.presets button.active { background: var(--c-primary); border-color: var(--c-primary); color: var(--c-on-primary); }
+
+/* 按钮 */
+.btn {
+  border: none; border-radius: 999px; padding: 9px 20px;
+  font-size: 13px; font-weight: 700; cursor: pointer;
+  background: var(--c-primary); color: var(--c-on-primary);
+  transition: filter .12s ease, transform .06s ease;
+}
+.btn:hover { filter: brightness(1.06); }
+.btn:active { transform: scale(.97); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.btn.small { padding: 6px 14px; font-size: 12px; }
+.btn.danger { background: var(--c-error-container); color: var(--c-on-error-container); }
+.card-foot { display: flex; align-items: center; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+.card-foot .note { font-size: 11.5px; color: var(--c-on-surface-variant); }
+
+/* ── 运行库卡片 ───────────────────────────────────────── */
+.mirrors { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0 12px; }
+.mirrors button {
+  border: 1px solid var(--c-outline-variant); background: var(--c-surface-container);
+  color: var(--c-on-surface-variant); border-radius: 999px; padding: 5px 13px;
+  font-size: 12px; font-weight: 600; cursor: pointer; transition: all .12s ease;
+}
+.mirrors button.active { background: var(--c-primary-container); color: var(--c-on-primary-container); border-color: var(--c-primary); }
+.pkg-table { border: 1px solid var(--c-outline-variant); border-radius: 12px; overflow: hidden; margin-bottom: 12px; }
+.pkg {
+  display: flex; align-items: center; gap: 9px; padding: 8px 12px;
+  font-size: 12.5px; border-bottom: 1px solid var(--c-outline-variant);
+}
+.pkg:last-child { border-bottom: none; }
+.pkg:nth-child(odd) { background: color-mix(in srgb, var(--c-surface-container) 40%, transparent); }
+.pkg .st { width: 20px; text-align: center; flex: none; font-size: 13px; }
+.pkg .nm { font-weight: 600; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 11.5px; }
+.pkg .vr { color: var(--c-on-surface-variant); font-size: 11px; }
+.pkg .sz { margin-left: auto; color: var(--c-on-surface-variant); font-variant-numeric: tabular-nums; flex: none; font-size: 11.5px; }
+.pkg .bar-mini { position: absolute; }
+.pkg.active { background: var(--c-primary-container) !important; }
+.pkg.active .nm { color: var(--c-on-primary-container); }
+.spin { display: inline-block; animation: rot 1s linear infinite; }
+@keyframes rot { to { transform: rotate(360deg); } }
+
+.prog-area { display: none; margin-bottom: 12px; }
+.prog-area.show { display: block; }
+.prog-label { display: flex; font-size: 12px; color: var(--c-on-surface-variant); margin-bottom: 5px; gap: 8px; flex-wrap: wrap; }
+.prog-label b { color: var(--c-on-surface); font-variant-numeric: tabular-nums; }
+.bar { height: 10px; border-radius: 5px; background: var(--c-surface-variant); overflow: hidden; position: relative; }
+.bar > i {
+  display: block; height: 100%; width: 0%; border-radius: 5px;
+  background: linear-gradient(90deg, var(--c-primary), color-mix(in srgb, var(--c-primary) 65%, var(--c-tertiary)));
+  transition: width .35s ease;
+}
+.bar.thin { height: 5px; margin-top: 8px; border-radius: 3px; }
+.bar.striped > i::after {
+  content: ""; position: absolute; inset: 0;
+  background: repeating-linear-gradient(-45deg, rgba(255,255,255,.18) 0 8px, transparent 8px 16px);
+  animation: stripe 0.8s linear infinite;
+}
+@keyframes stripe { to { background-position: 22.6px 0; } }
+.step-line { font-size: 12px; color: var(--c-on-surface-variant); margin-top: 7px; min-height: 1.4em; }
+.err-line {
+  display: none; font-size: 12px; margin-top: 8px; padding: 8px 11px; border-radius: 10px;
+  background: var(--c-error-container); color: var(--c-on-error-container); word-break: break-all;
+}
+.err-line.show { display: block; }
+.ok-line {
+  display: none; font-size: 12.5px; margin-top: 8px; padding: 9px 12px; border-radius: 10px;
+  background: var(--c-tertiary-container); color: var(--c-on-tertiary-container);
+}
+.ok-line.show { display: block; }
+.fine { font-size: 11.5px; color: var(--c-on-surface-variant); margin-top: 10px; line-height: 1.65; }
+.fine code {
+  font-family: ui-monospace, Consolas, monospace; font-size: 11px;
+  background: var(--c-surface-variant); border-radius: 5px; padding: 0 5px;
+}
+
+.foot { text-align: center; color: var(--c-on-surface-variant); font-size: 11px; margin-top: 16px; }
+.bridge-err {
+  display: none; padding: 10px 12px; border-radius: 10px; margin-bottom: 12px;
+  background: var(--c-error-container); color: var(--c-on-error-container); font-size: 12.5px;
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="head">
+    <span class="logo">🎤</span>
+    <div>
+      <h1 id="t-title">曼波 RVC 变声器</h1>
+    </div>
+    <span class="ver" id="ver">v?</span>
+    <span class="spacer"></span>
+    <span class="pill" id="enginePill"><span class="dot"></span><span id="enginePillText">…</span></span>
+  </div>
+
+  <div class="bridge-err" id="bridgeErr"></div>
+  <div class="alert" id="alert"><span id="alertIcon">⚠️</span><span id="alertText"></span>
+    <span class="spacer"></span><button class="btn small" id="alertBtn"></button>
+  </div>
+
+  <!-- ── 推理状态 ─────────────────────────────────── -->
+  <div class="card plain" id="cardStatus">
+    <div class="card-head" data-toggle="cardStatus">
+      <span class="chev">▼</span>
+      <div><h2 id="t-status">推理状态</h2><div class="sub" id="statusSub">…</div></div>
+      <span class="spacer"></span>
+      <button class="btn ghost small" id="btnReload" title="" ></button>
+    </div>
+    <div class="card-body-wrap"><div class="inner"><div class="card-body">
+      <div class="rows">
+        <div class="row"><span class="k" id="k-model">模型</span><span class="v mono" id="vModel">—</span></div>
+        <div class="row"><span class="k" id="k-ep">推理设备</span><span class="v" id="vEp">—</span></div>
+        <div class="row"><span class="k" id="k-ort">ORT 运行库</span><span class="v" id="vOrt">—</span></div>
+        <div class="row"><span class="k" id="k-cuda">CUDA 运行库</span><span class="v" id="vCuda">—</span></div>
+        <div class="row"><span class="k" id="k-stats">已处理 / 断流</span><span class="v" id="vStats">—</span></div>
+        <div class="row" id="rowDetail" style="display:none"><span class="k" id="k-detail">详情</span><span class="v" id="vDetail"></span></div>
+      </div>
+    </div></div></div>
+  </div>
+
+  <!-- ── 参数调节 ─────────────────────────────────── -->
+  <div class="card" id="cardParams">
+    <div class="card-head" data-toggle="cardParams">
+      <span class="chev">▼</span>
+      <div><h2 id="t-params">参数调节</h2><div class="sub" id="t-params-sub">改动即时生效 · 按安装持久化</div></div>
+    </div>
+    <div class="card-body-wrap"><div class="inner"><div class="card-body">
+
+      <div class="group">
+        <div class="group-title" id="g-quality">音质与上下文</div>
+        <div class="readout" id="readout"></div>
+        <div id="params-quality"></div>
+      </div>
+
+      <div class="group">
+        <div class="group-title" id="g-stability">稳定性</div>
+        <div id="params-stability"></div>
+      </div>
+
+      <div class="group">
+        <div class="group-title" id="g-voice">音色与模型</div>
+        <div id="params-voice"></div>
+        <div class="ctl">
+          <div class="ctl-top"><label id="l-ort_opt_level">ONNX Runtime 图优化等级</label></div>
+          <select class="sel" id="selOrtOpt">
+            <option value="all" id="opt-all">All（最快，默认）</option>
+            <option value="extended" id="opt-ext">Extended</option>
+            <option value="basic" id="opt-basic">Basic（最保守，v1.0 同款）</option>
+          </select>
+          <div class="hint" id="h-ort_opt_level">改动后会重建推理会话（1~3 秒静音）。怀疑图优化影响音色时切 Basic 对比。</div>
+        </div>
+      </div>
+
+      <div class="card-foot">
+        <button class="btn ghost small" id="btnReset"></button>
+        <span class="note" id="resetNote"></span>
+      </div>
+    </div></div></div>
+  </div>
+
+  <!-- ── CUDA 运行库（折叠卡片） ────────────────────── -->
+  <div class="card closed" id="cardFetch">
+    <div class="card-head" data-toggle="cardFetch">
+      <span class="chev">▼</span>
+      <div><h2 id="t-fetch">CUDA 运行库</h2><div class="sub" id="fetchSub">…</div></div>
+      <span class="spacer"></span>
+      <span class="pill" id="fetchPill" style="display:none"><span class="dot"></span><span id="fetchPillText"></span></span>
+    </div>
+    <div class="card-body-wrap"><div class="inner"><div class="card-body">
+
+      <div id="fetchIntro" class="fine" style="margin:0 0 4px"></div>
+
+      <div class="mirrors" id="mirrors"></div>
+
+      <div class="pkg-table" id="pkgTable"></div>
+
+      <div class="prog-area" id="progArea">
+        <div class="prog-label">
+          <span id="progTitle"></span><span class="spacer"></span>
+          <span><b id="progPct">0%</b> · <b id="progSpeed">—</b> · <span id="t-eta">剩余</span> <b id="progEta">—</b></span>
+        </div>
+        <div class="bar striped"><i id="progBarAll"></i></div>
+        <div class="bar thin"><i id="progBarPkg"></i></div>
+        <div class="step-line" id="progStep"></div>
+      </div>
+
+      <div class="err-line" id="fetchErr"></div>
+      <div class="ok-line" id="fetchOk"></div>
+
+      <div class="card-foot">
+        <button class="btn" id="btnFetch"></button>
+        <button class="btn danger small" id="btnCancel" style="display:none"></button>
+        <span class="note" id="fetchNote"></span>
+      </div>
+
+      <div class="fine" id="fetchFine"></div>
+    </div></div></div>
+  </div>
+
+  <div class="foot" id="foot"></div>
+</div>
+
+<script>
+'use strict';
+/* ── 宿主 postMessage 桥 ─────────────────────────────── */
+function call(api, args) {
+  return new Promise((resolve, reject) => {
+    const id = Math.random().toString(36).slice(2);
+    const onMsg = (e) => {
+      if (e.data && e.data.__micyou === 1 && e.data.id === id) {
+        window.removeEventListener('message', onMsg);
+        e.data.ok ? resolve(e.data.value) : reject(new Error(e.data.error));
+      }
+    };
+    window.addEventListener('message', onMsg);
+    window.parent.postMessage({ __micyou: 1, id, api, args: args || {} }, '*');
+    setTimeout(() => { window.removeEventListener('message', onMsg); reject(new Error('bridge timeout: ' + api)); }, 8000);
+  });
+}
+const trigger = (action, payload) =>
+  call('trigger', { action, payload: payload === undefined ? null : JSON.stringify(payload) });
+
+/* ── 本地化 ──────────────────────────────────────────── */
+const T = {
+  zh: {
+    title: '曼波 RVC 变声器',
+    status: '推理状态', params: '参数调节', fetch: 'CUDA 运行库',
+    paramsSub: '改动即时生效 · 按安装持久化',
+    model: '模型', ep: '推理设备', ort: 'ORT 运行库', cuda: 'CUDA 运行库',
+    stats: '已处理 / 断流', detail: '详情', reload: '重载模型', reloadTip: '增删 user_models/ 里的模型后点此重载，无需重启',
+    epCuda: 'CUDA（GPU）', epCpu: 'CPU', epOff: '未就绪',
+    blocks: (n, f) => `${n} 块 / ${f} 次`,
+    phaseLoading: '模型加载中…', phaseReady: '运行中', phaseError: '加载失败', phaseOff: '插件未启用',
+    ortOk: '完整（3/3）', ortBad: (miss) => `缺失：${miss.join('、')} —— 安装包不完整，请重新安装插件`,
+    cudaOk: (n) => `已就绪（${n}/19）`,
+    cudaMiss: (have, total, bytes) => `缺 ${total - have} 个（约 ${fmtBytes(bytes)}）—— 可在下方卡片一键拉取`,
+    gQuality: '音质与上下文', gStability: '稳定性', gVoice: '音色与模型',
+    reset: '恢复默认值', resetNote: '滑杆立即写入并热生效',
+    window: (ms, ok) => `推理音频长度 <b>${ms}ms</b> ${ok ? '<span class="tag-ok">✓ 音质达标</span>' : '<span class="tag-warn">⚠ 低于 1000ms，易出电音/金属声，优先加大左上下文</span>'}`,
+    latency: (a, b) => `估算延迟 <b>${a}~${b}ms</b>（右预读+淡化+抖动缓冲+块长）`,
+    f0Presets: [['女变男', -12], ['微调', 0], ['男变女', 12]],
+    fetchSubOk: (n) => `${n}/19 已就绪`,
+    fetchSubMiss: (n, bytes) => `缺 ${n} 个 · 需下载约 ${bytes}`,
+    fetchIntro: '从这里按固定版本拉取 NVIDIA 官方 PyPI 包并校验 SHA256，解压出 19 个运行库到插件的 <code>libs/</code> 目录。国内请选清华等镜像；单个镜像失败会自动切换下一个。',
+    btnFetch: '开始拉取', btnCancel: '取消', btnRetry: '重试',
+    fetchDone: '全部就绪', fetchBusy: '拉取中',
+    fetchNote: (dl, disk) => `下载 ${dl} · 解压后占 ${disk} · 磁盘峰值需约 4GB 空闲`,
+    fetchFine: '提示：拉取期间可正常使用（CPU 推理）；完成后插件会自动重建会话切换到 GPU（约 1~3 秒静音）。若之后仍显示 CPU，请把本插件关闭再启用一次。断点会保留，取消/断网后可继续。',
+    alertMiss: (n) => `CUDA 运行库缺失（${n}/19）—— 当前为 CPU 推理，延迟大且吃算力。`,
+    alertCta: '去拉取',
+    alertCrit: 'ONNX Runtime 运行库缺失 —— 插件安装包不完整，请重新安装插件。',
+    eta: '剩余', pkg: (i, n) => `包 ${i}/${n}`,
+    stWait: '等待', stSkip: '已就位', stDown: '下载中', stVerify: '校验中', stExtract: '解压中', stDone: '完成', stErr: '失败',
+    doneMsg: '19 个运行库已就位，正在切换到 GPU 推理…若稍后「推理设备」仍显示 CPU，请把插件关闭再启用一次。',
+    canceledMsg: '已取消，断点已保留，可点「开始拉取」继续。',
+    bridgeErr: (e) => `与宿主通信失败：${e}（需要较新版本的 MicYou，且插件已启用）`,
+    foot: '日志：插件目录 rvc_plugin.log · 模型放 user_models/ · 参数说明见 README',
+    mirrorLabel: '下载源',
+  },
+  en: {
+    title: 'Mambo RVC Voice Changer',
+    status: 'Inference', params: 'Parameters', fetch: 'CUDA Runtime',
+    paramsSub: 'Applies instantly · Persisted per install',
+    model: 'Model', ep: 'Device', ort: 'ORT runtime', cuda: 'CUDA runtime',
+    stats: 'Blocks / Flushes', detail: 'Detail', reload: 'Reload models', reloadTip: 'Click after adding/removing models in user_models/ — no restart needed',
+    epCuda: 'CUDA (GPU)', epCpu: 'CPU', epOff: 'Not ready',
+    blocks: (n, f) => `${n} blocks / ${f} flushes`,
+    phaseLoading: 'Loading models…', phaseReady: 'Running', phaseError: 'Load failed', phaseOff: 'Plugin disabled',
+    ortOk: 'Complete (3/3)', ortBad: (miss) => `Missing: ${miss.join(', ')} — broken install, please reinstall the plugin`,
+    cudaOk: (n) => `Ready (${n}/19)`,
+    cudaMiss: (have, total, bytes) => `${total - have} missing (~${fmtBytes(bytes)}) — one-click fetch below`,
+    gQuality: 'Quality & Context', gStability: 'Stability', gVoice: 'Voice & Model',
+    reset: 'Restore defaults', resetNote: 'Sliders write & apply live',
+    window: (ms, ok) => `Inference window <b>${ms}ms</b> ${ok ? '<span class="tag-ok">✓ good</span>' : '<span class="tag-warn">⚠ below 1000ms — robotic/metallic artifacts; raise Left Context first</span>'}`,
+    latency: (a, b) => `Est. latency <b>${a}~${b}ms</b> (lookahead+crossfade+jitter+chunk)`,
+    f0Presets: [['F→M', -12], ['Fine', 0], ['M→F', 12]],
+    fetchSubOk: (n) => `${n}/19 ready`,
+    fetchSubMiss: (n, bytes) => `${n} missing · ~${bytes} to download`,
+    fetchIntro: 'Downloads pinned NVIDIA PyPI wheels (SHA256-verified) and extracts the 19 runtime DLLs into the plugin\'s <code>libs/</code> folder. Pick a mirror near you; failures rotate to the next mirror automatically.',
+    btnFetch: 'Start fetch', btnCancel: 'Cancel', btnRetry: 'Retry',
+    fetchDone: 'All ready', fetchBusy: 'Fetching',
+    fetchNote: (dl, disk) => `Download ${dl} · ${disk} on disk · keep ~4GB free during fetch`,
+    fetchFine: 'You can keep using the plugin (CPU) while fetching. When done, sessions rebuild automatically to switch to GPU (1~3s of silence). If it still shows CPU afterwards, toggle the plugin off/on. Partial downloads are kept — resume anytime.',
+    alertMiss: (n) => `CUDA runtime missing (${n}/19) — running on CPU: higher latency & CPU load.`,
+    alertCta: 'Fetch now',
+    alertCrit: 'ONNX Runtime files missing — the install is broken, please reinstall the plugin.',
+    eta: 'ETA', pkg: (i, n) => `pkg ${i}/${n}`,
+    stWait: 'waiting', stSkip: 'present', stDown: 'downloading', stVerify: 'verifying', stExtract: 'extracting', stDone: 'done', stErr: 'failed',
+    doneMsg: 'All 19 runtime files ready — switching to GPU… If the device still shows CPU, toggle the plugin off and on once.',
+    canceledMsg: 'Canceled. Partial progress kept — press Start fetch to resume.',
+    bridgeErr: (e) => `Host bridge failed: ${e} (needs a recent MicYou and the plugin enabled)`,
+    foot: 'Log: rvc_plugin.log in plugin dir · Models go in user_models/ · See README',
+    mirrorLabel: 'Source',
+  },
+};
+let L = T.zh;
+let lang = 'zh';
+
+/* ── 参数定义（范围与插件 config::range 严格一致） ─────── */
+const PARAMS = {
+  quality: [
+    { key: 'left_context_ms', min: 0, max: 2000, step: 10, def: 720, unit: 'ms',
+      zh: ['左上下文', '不增加延迟，成比例增加算力。音质不满先加它'],
+      en: ['Left Context', 'No latency cost, proportional compute. Raise first for quality'] },
+    { key: 'chunk_ms', min: 20, max: 500, step: 10, def: 200, unit: 'ms',
+      zh: ['输出块 Chunk', '必须大于单块推理耗时 τ，否则积压断流。GPU 常见 100~200'],
+      en: ['Chunk Size', 'Must exceed per-block inference time τ or the stream flushes. GPU: 100~200'] },
+    { key: 'lookahead_ms', min: 0, max: 500, step: 10, def: 80, unit: 'ms',
+      zh: ['右预读 Lookahead', '延迟的主要来源之一，调延迟动它'],
+      en: ['Lookahead', 'Main latency contributor'] },
+    { key: 'crossfade_ms', min: 0, max: 100, step: 5, def: 50, unit: 'ms',
+      zh: ['交叉淡化', '掩盖块边界毛刺；边界有杂音就加大'],
+      en: ['Crossfade', 'Hides seam artifacts; raise if edges crackle'] },
+  ],
+  stability: [
+    { key: 'jitter_ms', min: 0, max: 300, step: 10, def: 0, unit: 'ms',
+      zh: ['抖动缓冲', '吸收推理耗时抖动，代价是等量固定延迟。偶发断流再加大'],
+      en: ['Jitter Buffer', 'Absorbs timing jitter at the cost of equal fixed latency'] },
+    { key: 'max_latency_ms', min: 50, max: 3000, step: 50, def: 300, unit: 'ms',
+      zh: ['积压上限', '推理跟不上时，积压超过它就丢最旧音频拉回延迟（一次短断流）'],
+      en: ['Max Backlog', 'When inference falls behind, oldest audio is dropped past this (short flush)'] },
+    { key: 'gate_enabled', type: 'bool', def: true,
+      zh: ['静音跳过推理', '安静的块不跑推理，省算力并自动排空积压'],
+      en: ['Silence Gate', 'Skip inference on silent blocks to save compute'] },
+    { key: 'gate_db', min: -100, max: -20, step: 1, def: -80, unit: 'dBFS',
+      zh: ['门限电平', '气声被吃掉就调低；环境噪声被放大就调高'],
+      en: ['Gate Threshold', 'Lower if breathiness is eaten; raise if noise is amplified'] },
+  ],
+  voice: [
+    { key: 'f0_up_key', min: -24, max: 24, step: 1, def: 0, unit: 'st',
+      zh: ['变调 Pitch', '男变女 +12，女变男 −12，同声线微调 ±2'],
+      en: ['Pitch Shift', 'M→F +12, F→M −12, fine-tune ±2'] },
+    { key: 'speaker_id', min: 0, max: 32, step: 1, def: 0, unit: '',
+      zh: ['音色编号 sid', '多音色模型才需要改；单音色保持 0'],
+      en: ['Speaker ID', 'Only for multi-speaker models; keep 0 otherwise'] },
+  ],
+};
+const MIRRORS = [
+  { id: 'tuna',    zh: '清华 TUNA',  en: 'Tsinghua' },
+  { id: 'aliyun',  zh: '阿里云',     en: 'Aliyun' },
+  { id: 'ustc',    zh: '中科大',     en: 'USTC' },
+  { id: 'tencent', zh: '腾讯云',     en: 'Tencent' },
+  { id: 'pypi',    zh: 'PyPI 官方',  en: 'PyPI' },
+];
+
+/* ── 运行时状态 ──────────────────────────────────────── */
+let cfg = {};          // 插件配置全集
+let rtStatus = null;   // rt_status
+let rtState = null;    // rt_state
+let mirrorSel = 'tuna';
+let pollTimer = null;
+let statusTries = 0;
+
+const $ = (id) => document.getElementById(id);
+const el = {};
+['enginePill','enginePillText','ver','alert','alertText','alertBtn','alertIcon','bridgeErr',
+ 'statusSub','vModel','vEp','vOrt','vCuda','vStats','vDetail','rowDetail','btnReload',
+ 'readout','params-quality','params-stability','params-voice','selOrtOpt','btnReset','resetNote',
+ 'fetchSub','fetchPill','fetchPillText','fetchIntro','mirrors','pkgTable','progArea','progTitle',
+ 'progPct','progSpeed','progEta','progBarAll','progBarPkg','progStep','fetchErr','fetchOk',
+ 'btnFetch','btnCancel','fetchNote','fetchFine','foot','cardFetch','t-eta'].forEach(i => el[i] = $(i));
+
+function fmtBytes(n) {
+  if (n == null) return '—';
+  if (n >= 1073741824) return (n / 1073741824).toFixed(2) + 'GB';
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + 'MB';
+  if (n >= 1024) return (n / 1024).toFixed(0) + 'KB';
+  return n + 'B';
+}
+function fmtSpeed(bps) {
+  if (!bps || bps < 1024) return '—';
+  return fmtBytes(bps) + '/s';
+}
+function fmtEta(sec) {
+  if (!isFinite(sec) || sec <= 0) return '—';
+  sec = Math.round(sec);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  return `${m}:${String(s).padStart(2,'0')}`;
+}
+function showBridgeErr(e) {
+  el.bridgeErr.textContent = L.bridgeErr(e && e.message ? e.message : e);
+  el.bridgeErr.style.display = 'block';
+}
+
+/* ── 折叠卡片 ────────────────────────────────────────── */
+document.querySelectorAll('.card-head[data-toggle]').forEach(h => {
+  h.addEventListener('click', (e) => {
+    if (e.target.closest('button')) return; // 头部里的按钮不触发折叠
+    $(h.dataset.toggle).classList.toggle('closed');
+  });
+});
+function openCard(id) { $(id).classList.remove('closed'); }
+
+/* ── 参数控件构建 ────────────────────────────────────── */
+function paramValue(key) {
+  const v = cfg[key];
+  const def = findDef(key);
+  if (v === undefined || v === null || v === '') return def ? def.def : 0;
+  return v;
+}
+function findDef(key) {
+  for (const g of Object.values(PARAMS)) {
+    const f = g.find(x => x.key === key);
+    if (f) return f;
+  }
+  return null;
+}
+function setFill(input) {
+  const pct = ((input.value - input.min) / (input.max - input.min)) * 100;
+  input.style.setProperty('--fill', pct + '%');
+}
+function buildParams() {
+  const mk = (container, list) => {
+    for (const f of list) {
+      if (f.type === 'bool') {
+        const row = document.createElement('div');
+        row.className = 'switch-row';
+        const sw = document.createElement('div');
+        sw.className = 'switch'; sw.id = 'sw-' + f.key;
+        const lab = document.createElement('div');
+        lab.innerHTML = `<div style="font-size:13px;font-weight:600">${f[lang][0]}</div>
+                         <div class="hint" style="font-size:11.5px;color:var(--c-on-surface-variant)">${f[lang][1]}</div>`;
+        sw.addEventListener('click', () => {
+          const nv = !sw.classList.contains('on');
+          sw.classList.toggle('on', nv);
+          cfg[f.key] = nv;
+          writeCfg(f.key, nv);
+          refreshDependent();
+        });
+        row.appendChild(sw); row.appendChild(lab);
+        container.appendChild(row);
+        continue;
+      }
+      const d = document.createElement('div');
+      d.className = 'ctl';
+      d.innerHTML = `
+        <div class="ctl-top">
+          <label for="in-${f.key}">${f[lang][0]}</label>
+          <span class="val" id="vv-${f.key}"></span>
+        </div>
+        <input type="range" id="in-${f.key}" min="${f.min}" max="${f.max}" step="${f.step}">
+        <div class="hint">${f[lang][1]}</div>`;
+      container.appendChild(d);
+      const input = d.querySelector('input');
+      const vv = d.querySelector('.val');
+      input.addEventListener('input', () => {
+        vv.textContent = input.value + (f.unit ? ' ' + f.unit : '');
+        setFill(input);
+        cfg[f.key] = Number(input.value);
+        updateReadout();
+      });
+      input.addEventListener('change', () => {
+        writeCfg(f.key, Number(input.value));
+      });
+    }
+  };
+  mk(el['params-quality'], PARAMS.quality);
+  mk(el['params-stability'], PARAMS.stability);
+  mk(el['params-voice'], PARAMS.voice);
+
+  // 变调预设
+  const f0 = PARAMS.voice[0];
+  const pre = document.createElement('div');
+  pre.className = 'presets';
+  L.f0Presets.forEach(([label, v]) => {
+    const b = document.createElement('button');
+    b.textContent = `${label} ${v > 0 ? '+' : ''}${v}`;
+    b.dataset.v = v;
+    b.addEventListener('click', () => {
+      setParamUI('f0_up_key', v);
+      writeCfg('f0_up_key', v);
+    });
+    pre.appendChild(b);
+  });
+  $('in-f0_up_key').closest('.ctl').appendChild(pre);
+  el.f0Presets = pre;
+
+  $('selOrtOpt').addEventListener('change', () => writeCfg('ort_opt_level', $('selOrtOpt').value));
+  el.btnReset.addEventListener('click', () => {
+    for (const g of Object.values(PARAMS)) for (const f of g) {
+      setParamUI(f.key, f.def);
+      writeCfg(f.key, f.def);
+    }
+    setParamUI('ort_opt_level', 'all');
+    writeCfg('ort_opt_level', 'all');
+  });
+  el.btnReload.addEventListener('click', () => trigger('reload').catch(showBridgeErr));
+  el.btnReload.textContent = L.reload;
+  el.btnReload.title = L.reloadTip;
+}
+function setParamUI(key, value) {
+  if (key === 'ort_opt_level') { $('selOrtOpt').value = value; return; }
+  const f = findDef(key);
+  if (!f) return;
+  if (f.type === 'bool') {
+    $('sw-' + key).classList.toggle('on', !!value);
+    cfg[key] = !!value;
+    refreshDependent();
+    return;
+  }
+  const input = $('in-' + key);
+  input.value = value;
+  setFill(input);
+  $('vv-' + key).textContent = value + (f.unit ? ' ' + f.unit : '');
+  cfg[key] = Number(value);
+  updateReadout();
+  if (key === 'f0_up_key' && el.f0Presets) {
+    el.f0Presets.querySelectorAll('button').forEach(b =>
+      b.classList.toggle('active', Number(b.dataset.v) === Number(value)));
+  }
+}
+function refreshFromCfg() {
+  for (const g of Object.values(PARAMS)) for (const f of g) setParamUI(f.key, paramValue(f.key));
+  const opt = cfg.ort_opt_level || 'all';
+  $('selOrtOpt').value = ['all','extended','basic'].includes(opt) ? opt : 'all';
+  refreshDependent();
+}
+function refreshDependent() {
+  const gateOn = !!cfg.gate_enabled;
+  const gdb = $('in-gate_db');
+  if (gdb) { gdb.disabled = !gateOn; }
+}
+function updateReadout() {
+  const left = Number(cfg.left_context_ms || 0);
+  const chunk = Number(cfg.chunk_ms || 0);
+  const look = Number(cfg.lookahead_ms || 0);
+  const cross = Number(cfg.crossfade_ms || 0);
+  const jitter = Number(cfg.jitter_ms || 0);
+  const win = left + chunk + look;
+  const lo = look + cross + jitter;
+  el.readout.innerHTML =
+    `<span>${L.window(win, win >= 1000)}</span><span style="opacity:.4">│</span><span>${L.latency(lo, lo + chunk)}</span>`;
+}
+async function writeCfg(key, value) {
+  try { await call('set_config', { key, value }); }
+  catch (e) { showBridgeErr(e); }
+}
+
+/* ── 运行库卡片 ──────────────────────────────────────── */
+function buildMirrors() {
+  el.mirrors.innerHTML = '';
+  const lab = document.createElement('span');
+  lab.style.cssText = 'font-size:12px;color:var(--c-on-surface-variant);align-self:center;margin-right:2px';
+  lab.textContent = L.mirrorLabel + ':';
+  el.mirrors.appendChild(lab);
+  for (const m of MIRRORS) {
+    const b = document.createElement('button');
+    b.textContent = lang === 'zh' ? m.zh : m.en;
+    b.dataset.id = m.id;
+    b.classList.toggle('active', m.id === mirrorSel);
+    b.addEventListener('click', () => {
+      mirrorSel = m.id;
+      el.mirrors.querySelectorAll('button').forEach(x => x.classList.toggle('active', x.dataset.id === m.id));
+      call('set_config', { key: 'rt_mirror', value: m.id }).catch(() => {});
+    });
+    el.mirrors.appendChild(b);
+  }
+}
+const ST_ICON = {
+  wait: ['○', 'stWait'], skip: ['✓', 'stSkip'], downloading: ['⟳', 'stDown'],
+  verifying: ['#', 'stVerify'], extracting: ['▣', 'stExtract'], done: ['✓', 'stDone'], error: ['✗', 'stErr'],
+};
+function buildPkgTable() {
+  el.pkgTable.innerHTML = '';
+  const pkgs = (rtStatus && rtStatus.pkgs) || [];
+  if (!pkgs.length) {
+    el.pkgTable.style.display = 'none';
+    return;
+  }
+  el.pkgTable.style.display = '';
+  pkgs.forEach((p, i) => {
+    const live = rtState && rtState.pkgs && rtState.pkgs[i];
+    const st = (live && live.state) || (p.have >= (p.files ? p.files.length : 1) ? 'skip' : 'wait');
+    const row = document.createElement('div');
+    row.className = 'pkg' + (['downloading','verifying','extracting'].includes(st) ? ' active' : '');
+    row.id = 'pkg-' + i;
+    const [icon, key] = ST_ICON[st] || ST_ICON.wait;
+    const spin = st === 'downloading' || st === 'extracting' || st === 'verifying';
+    row.innerHTML = `
+      <span class="st ${spin ? 'spin' : ''}" style="${st==='done'||st==='skip' ? 'color:var(--c-tertiary);font-weight:700' : st==='error' ? 'color:var(--c-error);font-weight:700' : ''}">${icon}</span>
+      <span><span class="nm">${p.name}</span> <span class="vr">v${p.version}</span>
+        <span class="vr" id="pkgst-${i}" style="margin-left:6px">${L[key]}</span></span>
+      <span class="sz">${fmtBytes(p.bytes)}</span>`;
+    row.title = (p.files || []).join('\n');
+    el.pkgTable.appendChild(row);
+  });
+}
+function updateFetchUI() {
+  const rt = rtStatus;
+  if (!rt) { buildPkgTable(); return; } // 盘点未回：不误报缺库，等第一次轮询
+  const have = rt.cuda.present, total = rt.cuda.total;
+  const missN = total - have;
+  const ortOk = rt.ort.ready;
+  const st = rtState ? rtState.state : 'idle';
+  const busy = ['downloading', 'verifying', 'extracting'].includes(st);
+
+  // 头部副标题 + pill
+  el.fetchSub.textContent = missN === 0
+    ? L.fetchSubOk(have)
+    : L.fetchSubMiss(missN, fmtBytes(rt ? rt.cuda.missing_bytes : 0));
+  el.fetchPill.style.display = '';
+  el.fetchPill.className = 'pill ' + (busy ? 'load' : st === 'error' ? 'err' : missN === 0 ? 'ok' : 'warn');
+  el.fetchPillText.textContent = busy ? L.fetchBusy : st === 'error' ? L.stErr : missN === 0 ? L.fetchDone : `${have}/${total}`;
+
+  // 顶部横幅
+  if (!ortOk) {
+    el.alert.className = 'alert crit show';
+    el.alertIcon.textContent = '⛔';
+    el.alertText.textContent = L.alertCrit;
+    el.alertBtn.style.display = 'none';
+  } else if (missN > 0 && !busy) {
+    el.alert.className = 'alert show';
+    el.alertIcon.textContent = '⚠️';
+    el.alertText.textContent = L.alertMiss(have);
+    el.alertBtn.style.display = '';
+    el.alertBtn.textContent = L.alertCta;
+    el.alertBtn.onclick = () => { openCard('cardFetch'); el.pkgTable.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); };
+  } else {
+    el.alert.className = 'alert';
+  }
+
+  // 缺库时默认展开拉取卡片（提醒用户操作）
+  if (missN > 0 && !el.cardFetch.dataset.userToggled) openCard('cardFetch');
+
+  // 按钮态
+  el.btnFetch.disabled = busy || !ortOk;
+  el.btnFetch.textContent = st === 'error' ? L.btnRetry : L.btnFetch;
+  el.btnFetch.style.display = missN === 0 && st !== 'error' ? 'none' : '';
+  el.btnCancel.style.display = busy ? '' : 'none';
+
+  // 进度区
+  if (rtState && (busy || st === 'error' || st === 'canceled' || st === 'done')) {
+    el.progArea.classList.add('show');
+    const allT = rtState.all_total || 1, allD = rtState.all_done || 0;
+    const pct = Math.min(100, (allD / allT) * 100);
+    el.progBarAll.style.width = pct.toFixed(1) + '%';
+    el.progPct.textContent = pct.toFixed(0) + '%';
+    el.progSpeed.textContent = busy ? fmtSpeed(rtState.speed_bps) : '—';
+    const eta = busy && rtState.speed_bps > 10240 ? (allT - allD) / rtState.speed_bps : NaN;
+    el.progEta.textContent = fmtEta(eta);
+    const bpct = rtState.bytes_total ? Math.min(100, (rtState.bytes_done / rtState.bytes_total) * 100) : 0;
+    el.progBarPkg.style.width = bpct.toFixed(1) + '%';
+    el.progTitle.innerHTML = busy && rtState.pkg_index >= 0
+      ? `${L.pkg(rtState.pkg_index + 1, rtState.pkg_count)} · <b>${rtState.pkg || ''}</b> · ${fmtBytes(rtState.bytes_done || 0)} / ${fmtBytes(rtState.bytes_total || 0)}`
+      : `<b>${fmtBytes(allD)} / ${fmtBytes(allT)}</b>`;
+    el.progStep.textContent = rtState.step || '';
+    el.fetchErr.className = 'err-line' + (st === 'error' ? ' show' : '');
+    el.fetchErr.textContent = rtState.error || '';
+    el.fetchOk.className = 'ok-line' + (st === 'done' || st === 'canceled' ? ' show' : '');
+    el.fetchOk.textContent = st === 'done' ? (missN === 0 ? L.doneMsg : rtState.step || '') : st === 'canceled' ? L.canceledMsg : '';
+  } else {
+    el.progArea.classList.remove('show');
+    el.fetchErr.className = 'err-line';
+    el.fetchOk.className = 'ok-line';
+  }
+  buildPkgTable();
+}
+
+/* ── 状态卡片 ────────────────────────────────────────── */
+function updateStatusUI() {
+  const rt = rtStatus;
+  if (!rt) return; // 盘点未回：保留占位符，不显示“插件未启用”
+  const eng = rt.engine;
+  const phase = eng ? eng.phase : 'off';
+  const pillCls = { ready: 'ok', loading: 'load', error: 'err', off: '' }[phase] || '';
+  el.enginePill.className = 'pill ' + pillCls;
+  el.enginePillText.textContent =
+    phase === 'ready' ? (eng.cuda ? L.epCuda : L.epCpu)
+    : phase === 'loading' ? L.phaseLoading
+    : phase === 'error' ? L.phaseError : L.phaseOff;
+  el.statusSub.textContent = phase === 'ready' ? (eng.model || '') :
+    phase === 'loading' ? L.phaseLoading : phase === 'error' ? L.phaseError : '';
+
+  $('vModel').textContent = eng && eng.model ? eng.model : '—';
+  $('vEp').innerHTML = eng && phase === 'ready'
+    ? (eng.cuda ? `<span class="chip gpu">CUDA</span>` : `<span class="chip cpu">CPU</span>`)
+    : '—';
+  if (rt) {
+    const miss = [];
+    if (!rt.ort.core) miss.push('onnxruntime.dll');
+    if (!rt.ort.cuda_provider) miss.push('onnxruntime_providers_cuda.dll');
+    if (!rt.ort.shared) miss.push('onnxruntime_providers_shared.dll');
+    $('vOrt').innerHTML = miss.length ? `<span style="color:var(--c-error)">${L.ortBad(miss)}</span>` : L.ortOk;
+    $('vCuda').innerHTML = rt.cuda.present >= rt.cuda.total
+      ? `<span style="color:var(--c-tertiary);font-weight:600">${L.cudaOk(rt.cuda.present)}</span>`
+      : L.cudaMiss(rt.cuda.present, rt.cuda.total, rt.cuda.missing_bytes);
+    $('vStats').textContent = L.blocks(eng ? eng.blocks : 0, eng ? eng.flushes : 0);
+    const d = eng && eng.detail ? eng.detail : '';
+    el.rowDetail.style.display = d ? '' : 'none';
+    $('vDetail').textContent = d;
+    el.ver.textContent = 'v' + (rt.plugin_version || '?');
+  }
+}
+
+/* ── 轮询 ────────────────────────────────────────────── */
+function schedulePoll(delay) {
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(pollOnce, delay);
+}
+async function pollOnce() {
+  try {
+    cfg = await call('get_config', {});
+    if (cfg && typeof cfg === 'object') {
+      rtStatus = cfg.rt_status || rtStatus;
+      rtState = cfg.rt_state || null;
+      if (cfg.rt_mirror) mirrorSel = cfg.rt_mirror;
+    }
+    el.bridgeErr.style.display = 'none';
+    // rt_status 缺失（老状态/尚未 init 完成）→ 主动要一次
+    if (!cfg.rt_status && statusTries < 6) {
+      statusTries++;
+      trigger('rt_status').catch(() => {});
+    } else if (cfg.rt_status) {
+      statusTries = 0;
+    }
+    refreshFromCfgSilent();
+    updateStatusUI();
+    updateFetchUI();
+    const st = rtState ? rtState.state : 'idle';
+    const busy = ['downloading', 'verifying', 'extracting'].includes(st);
+    schedulePoll(busy ? 500 : 2500);
+  } catch (e) {
+    showBridgeErr(e);
+    schedulePoll(5000);
+  }
+}
+let uiLock = false; // 拖动滑杆时不回写 UI，避免抖动
+function refreshFromCfgSilent() {
+  if (uiLock) return;
+  const active = document.activeElement;
+  const dragging = active && active.type === 'range';
+  for (const g of Object.values(PARAMS)) {
+    for (const f of g) {
+      if (dragging && active.id === 'in-' + f.key) continue;
+      const v = cfg[f.key];
+      if (v !== undefined && v !== null && v !== '') setParamUI(f.key, v);
+    }
+  }
+  const opt = cfg.ort_opt_level || 'all';
+  if (['all','extended','basic'].includes(opt) && $('selOrtOpt').value !== opt) $('selOrtOpt').value = opt;
+  el.mirrors.querySelectorAll('button').forEach(x => x.classList.toggle('active', x.dataset.id === mirrorSel));
+  refreshDependent();
+}
+
+/* ── 动作 ────────────────────────────────────────────── */
+el.btnFetch.addEventListener('click', async () => {
+  try {
+    el.btnFetch.disabled = true;
+    await trigger('rt_fetch', { mirror: mirrorSel });
+    schedulePoll(300);
+  } catch (e) { showBridgeErr(e); el.btnFetch.disabled = false; }
+});
+el.btnCancel.addEventListener('click', () => trigger('rt_cancel').catch(showBridgeErr));
+el.cardFetch.querySelector('.card-head').addEventListener('click', () => {
+  el.cardFetch.dataset.userToggled = '1';
+});
+
+/* ── 文案应用 ────────────────────────────────────────── */
+function applyTexts() {
+  document.documentElement.lang = lang === 'zh' ? 'zh' : 'en';
+  $('t-title').textContent = L.title;
+  $('t-status').textContent = L.status;
+  $('t-params').textContent = L.params;
+  $('t-params-sub').textContent = L.paramsSub;
+  $('t-fetch').textContent = L.fetch;
+  $('k-model').textContent = L.model; $('k-ep').textContent = L.ep;
+  $('k-ort').textContent = L.ort; $('k-cuda').textContent = L.cuda;
+  $('k-stats').textContent = L.stats; $('k-detail').textContent = L.detail;
+  $('g-quality').textContent = L.gQuality;
+  $('g-stability').textContent = L.gStability;
+  $('g-voice').textContent = L.gVoice;
+  $('l-ort_opt_level').textContent = lang === 'zh' ? 'ONNX Runtime 图优化等级' : 'ORT graph optimization';
+  $('opt-all').textContent = lang === 'zh' ? 'All（最快，默认）' : 'All (fastest, default)';
+  $('opt-ext').textContent = 'Extended';
+  $('opt-basic').textContent = lang === 'zh' ? 'Basic（最保守，v1.0 同款）' : 'Basic (most conservative)';
+  $('h-ort_opt_level').textContent = lang === 'zh'
+    ? '改动后会重建推理会话（1~3 秒静音）。怀疑图优化影响音色时切 Basic 对比。'
+    : 'Rebuilds sessions on change (1~3s silence). Try Basic if you suspect optimization artifacts.';
+  el.btnReset.textContent = L.reset;
+  el.resetNote.textContent = L.resetNote;
+  el.fetchIntro.innerHTML = L.fetchIntro;
+  el.fetchNote.textContent = L.fetchNote('2.09GB', '3.2GB');
+  el.fetchFine.innerHTML = L.fetchFine;
+  $('t-eta').textContent = L.eta;
+  el.foot.textContent = L.foot;
+}
+
+/* ── 启动 ────────────────────────────────────────────── */
+(async function boot() {
+  try {
+    const loc = await call('locale', {}).catch(() => '');
+    const s = String(loc && (loc.value || loc) || '').toLowerCase();
+    lang = (!s || s.startsWith('zh') || s === 'lzh' || s === 'cat') ? 'zh' : 'en';
+    // 宿主 locale 取值：zh / zh-hk / zh-tw / zh-ss / en / cat / lzh —— cat/lzh 也走中文
+  } catch (e) { lang = 'zh'; }
+  L = T[lang];
+  applyTexts();
+  buildParams();
+  buildMirrors();
+  refreshFromCfg();
+  updateStatusUI();
+  updateFetchUI();
+  // 打开面板即要一次最新盘点
+  trigger('rt_status').catch(() => {});
+  await pollOnce();
+})();
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) pollOnce();
+});
+</script>
+</body>
+</html>
