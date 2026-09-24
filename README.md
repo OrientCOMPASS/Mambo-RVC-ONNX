@@ -235,10 +235,20 @@ tools/gen_pins.py  重新生成 fetch.rs 的 pin 表（PyPI JSON + Range 读 whe
   `cargo test --release -- --ignored`
 - **端到端验证**：`../rvc-harness`（独立程序，不属于插件本体）通过真实 C ABI 加载编译产物、
   跑真实 ONNX Runtime 推理，把输出解码回时间轴来判定有没有复读/倒流/丢块/卡死
-- **CI**：`.github/workflows/main.yml` 每次 push 构建 dll + 跑单测；
-  `.github/workflows/release.yml` 在推 `v*` 标签时校验三处版本号一致、构建、检查 ABI 导出符号、
-  下载 ORT 官方 cuda12 包取 3 个 dll、复用 v1.1.0 Release 的模型（可用 `models_url` 输入覆盖），
-  打包 `opss.mambo-rvc-onnx.zip` + `plugin.json`（updateUrl 资产）发布 Release
+- **CI**：单一工作流 `.github/workflows/release.yml`（Build & Release，参考 Focus-Capture 模式）：
+  - push 到 main/dev → **development build**：编译 + 单测 + ABI 导出检查，从本仓库
+    `resources` Release 拉 `libs.zip` / `models.zip` 组装完整插件包，上传 artifact
+    `mambo-rvc-onnx-development`（根目录即包内容，解压可直接导入，保留 14 天）；不创建 release/tag
+  - 手动 **Run workflow**（workflow_dispatch）→ **正式发布**：选 bump 档位（none/patch/minor/major）。
+    plugin.json 与 Cargo.toml 版本永远同步修改（dll 内嵌 CARGO_PKG_VERSION，构建前写入）；
+    重复发布同版本在构建前就被拦截；发布 `opss.mambo-rvc-onnx-v<ver>.zip` + `plugin.json`
+    资产（zip 内 manifest、release 资产、市场 PR 三者同一份，downloadUrl 已指向版本化资产），
+    打 tag `v<ver>`；bump 结果回提交到 main（`[skip ci]`）
+- **资源包（`resources` Release）**：`libs.zip` = ONNX Runtime 1.27.1 cuda12 三件套，
+  `models.zip` = 3 个模型；CI 每次构建实时拉取、不做缓存——**更新资源（如升级 ORT）只需
+  重新上传同名资产，不用改 workflow**。注意 ORT 官方 1.27 起 PyPI 只发 CUDA 13 构建，
+  cuda12 构建只存在于其 GitHub Release 资产中；CUDA/cuDNN 的 19 个运行库不进插件包，
+  由面板拉取（`src/fetch.rs` pin 表，升级时同步跑 `tools/gen_pins.py`）
 - **实时安全**：`process()` 内无堆分配、无锁、无 Host API 调用；推理线程与下载线程都是自建子线程，
   按宿主规范同样不调用任何 Host API，需要给用户看的消息通过定时器回调在宿主线程转发。
   拉取进度 = 下载线程写 `Arc<Mutex<Progress>>`，宿主线程的 500ms 定时器读快照写 `set_config("rt_state")`，

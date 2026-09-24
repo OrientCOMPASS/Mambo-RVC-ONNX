@@ -1,47 +1,138 @@
-name: Release
+name: Build & Release
 
-# 打 v* 标签时：构建 dll → 组装完整插件包（含 3 个 ORT dll + 3 个模型 + panel.html）→ 发布 Release
-# CUDA/cuDNN 的 19 个运行库**不再打进包**，由用户在面板「CUDA 运行库」卡片一键拉取（国内镜像）。
+# 操作手册（参考 Focus-Capture 的构建方式）：
+#   * push 到 main / dev（任何提交）→ 仅自动构建 development build：
+#     Windows 编译 + 单测 + ABI 检查，然后从本仓库 `resources` Release 拉取
+#     libs.zip（3 个 ORT dll）与 models.zip（3 个模型），组装成完整插件包，
+#     作为 Actions artifact（mambo-rvc-onnx-development，根目录即包内容，
+#     下载解压后可直接导入），**绝不创建 release / tag**。
+#   * 发 release：Actions 页面 → Run workflow（workflow_dispatch），
+#     可选 bump 档位（none/patch/minor/major，默认 none = 用 main 上
+#     plugin.json 的当前版本）。流程：构建 → 组装 → 打 tag v<ver> →
+#     创建 Release（资产：opss.mambo-rvc-onnx-v<ver>.zip 主包 + plugin.json
+#     （与 zip 内 manifest 同一份，供手动市场 PR 与更新检查））。
+#     若选择 bump 档位，新版本号（plugin.json + Cargo.toml，二者必须同步，
+#     因为 dll 内嵌 CARGO_PKG_VERSION）会在打包前写好，发布后回提交到 main
+#     （提交信息带 [skip ci]）。
+#   * 同一版本重复发 release 会在第一个 job 就直接失败（tag 已存在），防止误覆盖。
+#   * 提交信息含 [skip ci] → 整个 workflow 跳过（GitHub 原生支持）。
+#   * 运行库资源：`resources` Release 的 libs.zip / models.zip（更新资源 =
+#     重新上传同名资产即可，workflow 每次实时拉取，不做缓存）。
+#     CUDA/cuDNN 的 19 个运行库不在包里，由用户在面板一键拉取（src/fetch.rs）。
+
 on:
   push:
-    tags: ['v*']
+    branches: [main, dev]
   workflow_dispatch:
     inputs:
-      models_url:
-        description: '模型 zip 的 URL（须含 hubert_base.onnx / rmvpe.onnx / uma-Matikane_Tannhauser.onnx；留空 = 复用 v1.1.0 Release 包内的 models/）'
-        required: false
-        default: ''
+      bump:
+        description: "Release 版本档位：none = 使用 main 上 plugin.json 当前版本"
+        type: choice
+        default: none
+        options: [none, patch, minor, major]
+
+permissions:
+  contents: write
 
 env:
-  # ONNX Runtime：必须用 GitHub Release 的 cuda12 专用包（PyPI 的 onnxruntime-gpu 1.27+ 已切 CUDA 13）。
-  # 1.27.1 = 与面板拉取的 CUDA 12.9 / cuDNN 9.25 运行库组合经过实测。
-  ORT_ZIP_URL: https://github.com/microsoft/onnxruntime/releases/download/v1.27.1/onnxruntime-win-x64-gpu_cuda12-1.27.1.zip
-  ORT_ZIP_NAME: onnxruntime-win-x64-gpu_cuda12-1.27.1.zip
-  ORT_ZIP_ROOT: onnxruntime-win-x64-gpu_cuda12-1.27.1
-  # 模型不在仓库里（体积太大），默认复用上一个带模型的 Release 包
-  MODELS_FALLBACK_URL: https://github.com/OrientCOMPASS/Mambo-RVC-ONNX/releases/download/v1.1.0/opss.mambo-rvc-onnx.zip
-  PLUGIN_ZIP: opss.mambo-rvc-onnx.zip
+  CARGO_TERM_COLOR: always
+  RESOURCES_BASE: https://github.com/OrientCOMPASS/Mambo-RVC-ONNX/releases/download/resources
+  PLUGIN_ID: opss.mambo-rvc-onnx
 
 jobs:
-  release:
-    name: 构建并发布 Release
+  # ── 版本号裁决（快速失败：版本漂移 / 重复发布都在烧 Windows 分钟之前拦下）──
+  prepare:
+    name: 版本号与预检
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      bumped: ${{ steps.ver.outputs.bumped }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: 决定版本号（bump 档位；校验 plugin.json 与 Cargo.toml 一致）
+        id: ver
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          bump = os.environ.get('BUMP') or 'none'
+          m = json.load(open('plugin.json', encoding='utf-8'))
+          cargo = open('Cargo.toml', encoding='utf-8').read()
+          cm = re.search(r'^version = "([^"]+)"', cargo, re.M)
+          if not cm:
+              raise SystemExit('Cargo.toml 里找不到 package version')
+          if cm.group(1) != m['version']:
+              raise SystemExit(f"版本漂移: plugin.json={m['version']} Cargo.toml={cm.group(1)}，请先同步")
+          maj, mi, pa = (int(x) for x in m['version'].split('.')[:3])
+          if bump == 'patch':
+              pa += 1
+          elif bump == 'minor':
+              mi += 1; pa = 0
+          elif bump == 'major':
+              maj += 1; mi = 0; pa = 0
+          elif bump != 'none':
+              raise SystemExit(f'未知 bump 档位: {bump}')
+          ver = f'{maj}.{mi}.{pa}'
+          bumped = bump != 'none'
+          if bumped:
+              # 打包前就把新版本写进 plugin.json + Cargo.toml ⇒
+              # dll 内嵌的 CARGO_PKG_VERSION、manifest、tag 三者一致
+              m['version'] = ver
+              with open('plugin.json', 'w', encoding='utf-8') as f:
+                  json.dump(m, f, ensure_ascii=False, indent=2)
+                  f.write('\n')
+              cargo = re.sub(r'^version = "[^"]+"', f'version = "{ver}"', cargo, count=1, flags=re.M)
+              open('Cargo.toml', 'w', encoding='utf-8').write(cargo)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'version={ver}\n')
+              f.write(f"bumped={'true' if bumped else 'false'}\n")
+          print('release version:', ver, f'(bump={bump})')
+          PY
+        env:
+          BUMP: ${{ github.event.inputs.bump }}
+
+      - name: 防止重复发布同版本（仅手动 release）
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if gh release view "v${{ steps.ver.outputs.version }}" >/dev/null 2>&1; then
+            echo "::error::release v${{ steps.ver.outputs.version }} 已存在；请在 main 修改 plugin.json 版本或选择 bump 档位"
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: 上传版本化清单（plugin.json + Cargo.toml）
+        uses: actions/upload-artifact@v7
+        with:
+          name: versioned-files
+          path: |
+            plugin.json
+            Cargo.toml
+
+  # ── Windows 构建（唯一的编译矩阵：本插件仅 windows x86_64）──
+  build:
+    name: 构建 windows-x86_64
+    needs: [prepare]
     runs-on: windows-latest
     steps:
-      - name: Checkout 仓库代码
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
 
-      - name: 校验版本号一致（tag / plugin.json / Cargo.toml）
-        shell: pwsh
+      - name: 应用版本化清单（bump 时为新版本；push 时与仓库一致）
+        uses: actions/download-artifact@v7
+        with:
+          name: versioned-files
+          path: versioned
+
+      - name: 覆盖工作区清单（须在 cargo build 之前，dll 内嵌 CARGO_PKG_VERSION）
+        shell: bash
         run: |
-          if ("${{ github.ref }}" -notlike "refs/tags/*") { Write-Host "非 tag 触发，跳过版本校验"; exit 0 }
-          $tag = "${{ github.ref_name }}" -replace '^v',''
-          $pj = (Get-Content plugin.json -Raw | ConvertFrom-Json).version
-          $ct = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
-          if ($tag -ne $pj -or $tag -ne $ct) {
-            Write-Error "版本不一致: tag=$tag plugin.json=$pj Cargo.toml=$ct"
-            exit 1
-          }
-          Write-Host "版本一致: $tag"
+          cp versioned/plugin.json plugin.json
+          cp versioned/Cargo.toml Cargo.toml
+          grep -m1 '^version' Cargo.toml
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
@@ -52,7 +143,7 @@ jobs:
       - name: 单元测试
         run: cargo test --release
 
-      - name: 执行 Release 构建
+      - name: Release 构建
         run: cargo build --release
 
       - name: 配置 MSVC 环境（dumpbin）
@@ -68,83 +159,156 @@ jobs:
           if ($missing) { Write-Error "缺少导出符号: $missing"; exit 1 }
           Write-Host "ABI 导出符号齐全 ($($need.Count))"
 
-      - name: 缓存 ONNX Runtime cuda12 包
-        uses: actions/cache@v4
+      - name: 上传平台产物
+        uses: actions/upload-artifact@v7
         with:
-          path: ${{ env.ORT_ZIP_NAME }}
-          key: ort-${{ env.ORT_ZIP_NAME }}
+          name: plugin-dll
+          path: target/release/mambo_rvc_onnx.dll
 
-      - name: 下载 ONNX Runtime（缓存未命中时）
-        shell: pwsh
+  # ── development 包（仅 push）：完整可安装的插件包 artifact ──
+  dev-package:
+    name: development 包（仅 push）
+    if: github.event_name == 'push'
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: 下载构建产物
+        uses: actions/download-artifact@v7
+        with:
+          name: plugin-dll
+          path: stage
+
+      - name: 下载版本化清单
+        uses: actions/download-artifact@v7
+        with:
+          name: versioned-files
+          path: versioned
+
+      - name: 拉取资源包（resources Release：libs.zip + models.zip）
         run: |
-          if (-not (Test-Path "${{ env.ORT_ZIP_NAME }}")) {
-            curl.exe -L --retry 3 -o "${{ env.ORT_ZIP_NAME }}" "${{ env.ORT_ZIP_URL }}"
-            if ($LASTEXITCODE -ne 0) { exit 1 }
-          }
-          (Get-Item "${{ env.ORT_ZIP_NAME }}").Length
+          set -euo pipefail
+          curl -fsSL --retry 5 --retry-delay 3 -o /tmp/libs.zip   "$RESOURCES_BASE/libs.zip"
+          curl -fsSL --retry 5 --retry-delay 3 -o /tmp/models.zip "$RESOURCES_BASE/models.zip"
+          ls -la /tmp/libs.zip /tmp/models.zip
 
-      - name: 下载模型包（Release 之间同源，不做缓存以保证自定义 URL 的正确性）
-        shell: pwsh
+      - name: 组装 + 校验（根即 plugin.json，可直接安装/导入）
         run: |
-          $url = "${{ github.event.inputs.models_url }}"
-          if (-not $url) { $url = "${{ env.MODELS_FALLBACK_URL }}" }
-          Write-Host "models url: $url"
-          curl.exe -L --retry 3 -o models_src.zip $url
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          (Get-Item models_src.zip).Length
+          set -euo pipefail
+          VER="${{ needs.prepare.outputs.version }}"
+          cp versioned/plugin.json stage/plugin.json
+          cp panel.html README.md LICENSE stage/
+          unzip -q /tmp/libs.zip   -d stage/    # → stage/libs/*.dll
+          unzip -q /tmp/models.zip -d stage/    # → stage/models/*.onnx
+          # 校验：3 dll + 3 onnx + 版本一致
+          test "$(find stage/libs -name '*.dll' | wc -l)" -eq 3
+          test -f stage/libs/onnxruntime.dll
+          test -f stage/libs/onnxruntime_providers_cuda.dll
+          test -f stage/libs/onnxruntime_providers_shared.dll
+          test "$(find stage/models -name '*.onnx' | wc -l)" -eq 3
+          test -f stage/models/hubert_base.onnx
+          test -f stage/models/rmvpe.onnx
+          test -f stage/models/uma-Matikane_Tannhauser.onnx
+          test -f stage/mambo_rvc_onnx.dll
+          python3 -c "import json,sys; v=json.load(open('stage/plugin.json'))['version']; sys.exit(0 if v=='$VER' else f'manifest {v} != $VER')"
+          find stage -type f | sort && du -sh stage
 
-      - name: 组装发布目录
-        shell: pwsh
+      # artifact zip 的根即包内容（upload-artifact 会剥离公共父目录），
+      # 下载后解压即得可直接导入的插件目录
+      - name: 上传 development artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mambo-rvc-onnx-development
+          path: stage
+          retention-days: 14
+
+  # ── 手动发布 Release（仅 workflow_dispatch）──
+  release:
+    name: 手动发布 Release
+    if: github.event_name == 'workflow_dispatch'
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: 下载构建产物
+        uses: actions/download-artifact@v7
+        with:
+          name: plugin-dll
+          path: stage
+
+      - name: 下载版本化清单
+        uses: actions/download-artifact@v7
+        with:
+          name: versioned-files
+          path: versioned
+
+      - name: 拉取资源包（resources Release：libs.zip + models.zip）
         run: |
-          $stage = "stage"
-          Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Path "$stage/libs", "$stage/models" | Out-Null
+          set -euo pipefail
+          curl -fsSL --retry 5 --retry-delay 3 -o /tmp/libs.zip   "$RESOURCES_BASE/libs.zip"
+          curl -fsSL --retry 5 --retry-delay 3 -o /tmp/models.zip "$RESOURCES_BASE/models.zip"
+          ls -la /tmp/libs.zip /tmp/models.zip
 
-          # 1) 插件本体
-          Copy-Item target/release/mambo_rvc_onnx.dll "$stage/mambo_rvc_onnx.dll"
-          Copy-Item plugin.json, panel.html, README.md, LICENSE $stage
-
-          # 2) libs/：从 ORT cuda12 官方包取 3 个 dll（不含 tensorrt provider）
-          tar -xf "${{ env.ORT_ZIP_NAME }}" -C . "${{ env.ORT_ZIP_ROOT }}/lib/onnxruntime.dll" `
-              "${{ env.ORT_ZIP_ROOT }}/lib/onnxruntime_providers_cuda.dll" `
-              "${{ env.ORT_ZIP_ROOT }}/lib/onnxruntime_providers_shared.dll"
-          Copy-Item "${{ env.ORT_ZIP_ROOT }}/lib/onnxruntime.dll" "$stage/libs/"
-          Copy-Item "${{ env.ORT_ZIP_ROOT }}/lib/onnxruntime_providers_cuda.dll" "$stage/libs/"
-          Copy-Item "${{ env.ORT_ZIP_ROOT }}/lib/onnxruntime_providers_shared.dll" "$stage/libs/"
-          Remove-Item -Recurse -Force "${{ env.ORT_ZIP_ROOT }}"
-
-          # 3) models/：解出 3 个 onnx（兼容包内带 models/ 前缀或直接是 onnx 两种布局）
-          $tmp = "models_tmp"
-          New-Item -ItemType Directory $tmp -Force | Out-Null
-          tar -xf models_src.zip -C $tmp
-          if ($LASTEXITCODE -ne 0) { Write-Error "模型包解压失败"; exit 1 }
-          $onnx = Get-ChildItem -Recurse $tmp -Filter *.onnx
-          foreach ($f in $onnx) { Copy-Item $f.FullName "$stage/models/" }
-          Remove-Item -Recurse -Force $tmp
-          $need = @('hubert_base.onnx','rmvpe.onnx','uma-Matikane_Tannhauser.onnx')
-          $missing = $need | Where-Object { -not (Test-Path "$stage/models/$_") }
-          if ($missing) { Write-Error "模型缺失: $missing"; exit 1 }
-
-          # 4) 校验 libs/ 三件套齐全
-          $libs = Get-ChildItem "$stage/libs" -Filter *.dll | Select-Object -ExpandProperty Name
-          Write-Host "libs/: $libs"
-          if ($libs.Count -ne 3) { Write-Error "libs/ 应为 3 个 dll，实际 $($libs.Count)"; exit 1 }
-
-      - name: 打包 zip
-        shell: pwsh
+      - name: 组装发布包（plugin.json 全通道同一份）
         run: |
-          # bsdtar 按扩展名生成 zip；根目录直接含 plugin.json（宿主导入要求）
-          tar -a -cf "${{ env.PLUGIN_ZIP }}" -C stage plugin.json panel.html README.md LICENSE mambo_rvc_onnx.dll libs models
-          $z = Get-Item "${{ env.PLUGIN_ZIP }}"
-          Write-Host ("zip: {0:N0} bytes" -f $z.Length)
-          if ($z.Length -lt 500MB) { Write-Error "zip 体积异常（小于 500MB），模型可能没打进去"; exit 1 }
+          set -euo pipefail
+          VER="${{ needs.prepare.outputs.version }}"
+          cp versioned/plugin.json plugin.json      # 工作区也换成版本化清单（回提交用）
+          cp versioned/Cargo.toml  Cargo.toml
+          cp plugin.json panel.html README.md LICENSE stage/
+          unzip -q /tmp/libs.zip   -d stage/
+          unzip -q /tmp/models.zip -d stage/
+          test "$(find stage/libs -name '*.dll' | wc -l)" -eq 3
+          test "$(find stage/models -name '*.onnx' | wc -l)" -eq 3
+          test -f stage/mambo_rvc_onnx.dll
+          # 先写入版本化 downloadUrl 再打包 ⇒ zip 内 manifest == release 的
+          # plugin.json 资产 == 手动市场 PR 所用文件，三者同一份
+          python3 - <<PY
+          import json
+          p = 'stage/plugin.json'
+          m = json.load(open(p, encoding='utf-8'))
+          assert m['version'] == '$VER', m['version']
+          m['downloadUrl'] = f"https://github.com/OrientCOMPASS/Mambo-RVC-ONNX/releases/download/v{m['version']}/${PLUGIN_ID}-v{m['version']}.zip"
+          json.dump(m, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+          open(p, 'a').write('\n')
+          PY
+          cp stage/plugin.json plugin.json          # release 资产与 zip 内完全同一份
+          mkdir -p dist
+          (cd stage && zip -q -r "../dist/${PLUGIN_ID}-v${VER}.zip" .)
+          ls -la dist/
+          test "$(stat -c%s dist/${PLUGIN_ID}-v${VER}.zip)" -gt 500000000  # >500MB，资源没漏
 
-      - name: 发布 GitHub Release
+      - name: 生成变更日志（自上一个 v* tag）
+        run: |
+          LAST=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo "")
+          if [ -n "$LAST" ]; then git log --oneline "$LAST..HEAD" > /tmp/notes.md; else git log --oneline -20 > /tmp/notes.md; fi
+          echo "" >> /tmp/notes.md
+          echo "Windows x86_64 单包。包内含 ONNX Runtime（CUDA 12 构建）三件套与 3 个模型；" >> /tmp/notes.md
+          echo "CUDA/cuDNN 的 19 个运行库不随包分发——启用插件后在 设置 → 曼波RVC 控制台 面板一键拉取（国内镜像 + 断点续传 + SHA256 校验）。" >> /tmp/notes.md
+          echo "release 的 plugin.json 资产可直接用于向 MicYou-Plugins 提手动市场 PR。" >> /tmp/notes.md
+
+      - name: bump 回提交到 main（[skip ci]）
+        if: needs.prepare.outputs.bumped == 'true'
+        run: |
+          git add plugin.json Cargo.toml
+          git commit -m "chore(release): bump version to ${{ needs.prepare.outputs.version }} [skip ci]"
+          git push origin HEAD:main
+
+      - name: 打 tag 并发布 Release
+        run: |
+          VER="${{ needs.prepare.outputs.version }}"
+          git config user.name "mambo-rvc-ci"
+          git config user.email "ci@users.noreply.github.com"
+          git tag "v${VER}"
+          git push origin "v${VER}"
+          gh release create "v${VER}" "dist/${PLUGIN_ID}-v${VER}.zip" plugin.json \
+            --title "v${VER}" --notes-file /tmp/notes.md
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: pwsh
-        run: |
-          gh release create "${{ github.ref_name }}" `
-            "${{ env.PLUGIN_ZIP }}" plugin.json `
-            --title "${{ github.ref_name }}" --generate-notes
-          Write-Host "已发布 ${{ github.ref_name }}：${{ env.PLUGIN_ZIP }} + plugin.json（updateUrl 资产）"
