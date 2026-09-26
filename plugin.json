@@ -179,7 +179,7 @@
   "repository": "https://github.com/OrientCOMPASS/Mambo-RVC-ONNX",
   "homepage": "https://github.com/OrientCOMPASS/Mambo-RVC-ONNX",
   "updateUrl": "https://github.com/OrientCOMPASS/Mambo-RVC-ONNX/releases/latest/download/plugin.json",
-  "downloadUrl": "https://github.com/OrientCOMPASS/Mambo-RVC-ONNX/releases/latest/download/opss.mambo-rvc-onnx.zip",
+  "downloadUrl": "https://github.com/OrientCOMPASS/Mambo-RVC-ONNX/releases/latest/download/plugin.zip",
   "readmeUrl": "https://raw.githubusercontent.com/OrientCOMPASS/Mambo-RVC-ONNX/refs/heads/main/README.md",
   "ui": {
     "route": "panel",
