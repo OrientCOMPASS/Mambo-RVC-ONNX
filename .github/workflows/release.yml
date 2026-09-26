@@ -9,8 +9,10 @@ name: Build & Release
 #   * 发 release：Actions 页面 → Run workflow（workflow_dispatch），
 #     可选 bump 档位（none/patch/minor/major，默认 none = 用 main 上
 #     plugin.json 的当前版本）。流程：构建 → 组装 → 打 tag v<ver> →
-#     创建 Release（资产：opss.mambo-rvc-onnx-v<ver>.zip 主包 + plugin.json
-#     （与 zip 内 manifest 同一份，供手动市场 PR 与更新检查））。
+#     创建 Release（资产：plugin.zip 主包（固定名，不带版本号）+ plugin.json
+#     （与 zip 内 manifest 同一份，供手动市场 PR 与更新检查）；plugin.json 的
+#     downloadUrl 在仓库 manifest 里固定指向 releases/latest/download/plugin.zip，
+#     CI 只校验不回写）。
 #     若选择 bump 档位，新版本号（plugin.json + Cargo.toml，二者必须同步，
 #     因为 dll 内嵌 CARGO_PKG_VERSION）会在打包前写好，发布后回提交到 main
 #     （提交信息带 [skip ci]）。
@@ -256,7 +258,7 @@ jobs:
           curl -fsSL --retry 5 --retry-delay 3 -o /tmp/models.zip "$RESOURCES_BASE/models.zip"
           ls -la /tmp/libs.zip /tmp/models.zip
 
-      - name: 组装发布包（plugin.json 全通道同一份）
+      - name: 组装发布包（plugin.json 全通道同一份，downloadUrl 固定指向 latest）
         run: |
           set -euo pipefail
           VER="${{ needs.prepare.outputs.version }}"
@@ -268,29 +270,30 @@ jobs:
           test "$(find stage/libs -name '*.dll' | wc -l)" -eq 3
           test "$(find stage/models -name '*.onnx' | wc -l)" -eq 3
           test -f stage/mambo_rvc_onnx.dll
-          # 先写入版本化 downloadUrl 再打包 ⇒ zip 内 manifest == release 的
+          # downloadUrl 不再按版本回写：仓库 plugin.json 固定指向
+          # releases/latest/download/plugin.zip ⇒ zip 内 manifest == release 的
           # plugin.json 资产 == 手动市场 PR 所用文件，三者同一份
-          python3 - <<PY
-          import json
-          p = 'stage/plugin.json'
-          m = json.load(open(p, encoding='utf-8'))
-          assert m['version'] == '$VER', m['version']
-          m['downloadUrl'] = f"https://github.com/OrientCOMPASS/Mambo-RVC-ONNX/releases/download/v{m['version']}/${PLUGIN_ID}-v{m['version']}.zip"
-          json.dump(m, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
-          open(p, 'a').write('\n')
+          python3 - "$VER" <<'PY'
+          import json, sys
+          ver = sys.argv[1]
+          expect = "https://github.com/OrientCOMPASS/Mambo-RVC-ONNX/releases/latest/download/plugin.zip"
+          m = json.load(open('stage/plugin.json', encoding='utf-8'))
+          assert m['version'] == ver, f"manifest version {m['version']} != {ver}"
+          assert m.get('downloadUrl') == expect, \
+              f"plugin.json 的 downloadUrl 应为 {expect}，实际为 {m.get('downloadUrl')!r}"
           PY
           cp stage/plugin.json plugin.json          # release 资产与 zip 内完全同一份
           mkdir -p dist
-          (cd stage && zip -q -r "../dist/${PLUGIN_ID}-v${VER}.zip" .)
+          (cd stage && zip -q -r ../dist/plugin.zip .)
           ls -la dist/
-          test "$(stat -c%s dist/${PLUGIN_ID}-v${VER}.zip)" -gt 500000000  # >500MB，资源没漏
+          test "$(stat -c%s dist/plugin.zip)" -gt 500000000  # >500MB，资源没漏
 
       - name: 生成变更日志（自上一个 v* tag）
         run: |
           LAST=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo "")
           if [ -n "$LAST" ]; then git log --oneline "$LAST..HEAD" > /tmp/notes.md; else git log --oneline -20 > /tmp/notes.md; fi
           echo "" >> /tmp/notes.md
-          echo "Windows x86_64 单包。包内含 ONNX Runtime（CUDA 12 构建）三件套与 3 个模型；" >> /tmp/notes.md
+          echo "Windows x86_64 单包（主包固定名 plugin.zip，不带版本号；下载/更新统一走 releases/latest/download/plugin.zip）。包内含 ONNX Runtime（CUDA 12 构建）三件套与 3 个模型；" >> /tmp/notes.md
           echo "CUDA/cuDNN 的 19 个运行库不随包分发——启用插件后在 设置 → 曼波RVC 控制台 面板一键拉取（国内镜像 + 断点续传 + SHA256 校验）。" >> /tmp/notes.md
           echo "release 的 plugin.json 资产可直接用于向 MicYou-Plugins 提手动市场 PR。" >> /tmp/notes.md
 
@@ -308,7 +311,7 @@ jobs:
           git config user.email "ci@users.noreply.github.com"
           git tag "v${VER}"
           git push origin "v${VER}"
-          gh release create "v${VER}" "dist/${PLUGIN_ID}-v${VER}.zip" plugin.json \
+          gh release create "v${VER}" dist/plugin.zip plugin.json \
             --title "v${VER}" --notes-file /tmp/notes.md
         env:
           GH_TOKEN: ${{ github.token }}
